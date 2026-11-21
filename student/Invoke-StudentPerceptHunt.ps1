@@ -3,6 +3,9 @@
 .SYNOPSIS
     Consolidated, bounded relational percept-acquisition instrument (SMA / CoreCLR / PSC).
 .DESCRIPTION
+    "A percept is a coordinate that reveals itself, through a transformation or mutation,
+    that collapses an apparently complex high-dimensional trajectory into a small, bounded invariant."
+
     Dot-source with -Library to use typed borrowed views over the existing bank.
     Run without arguments for full synthetic acquisition, disequilibrium, accommodation,
     strict lowering-parity, weak-rematerialization, reverie-wake, external delegate hook,
