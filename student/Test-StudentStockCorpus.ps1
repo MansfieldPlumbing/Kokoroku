@@ -1,14 +1,20 @@
 using module ./StudentTeacherObservation.psm1
+using module ./Providence.Field.psm1
 #requires -Version 7.7
 param(
     [string] $BankPath=(Join-Path $PSScriptRoot '../data/source-bank'),
     [string] $SourceIdentity='Gutenberg/11',
     [int[]] $Offset,
-    [switch] $VerifyBuffers
+    [switch] $VerifyBuffers,
+    [switch] $VerifyHandoff
 )
 $ErrorActionPreference='Stop'
 $field=& "$PSScriptRoot/Open-StudentSpeechInvestigation.ps1" -BankPath $BankPath -SourceIdentity $SourceIdentity
 $checked=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+if ($VerifyHandoff) {
+    $providence = New-ProvidenceField
+    foreach ($method in Get-StudentStockObservationMethod) { $providence.PublishObservation($method) }
+}
 foreach ($comparison in $field.Comparisons) {
     $teacher=$comparison.Teacher
     if ($null -ne $Offset -and $teacher.Start -notin $Offset) { continue }
@@ -34,6 +40,23 @@ foreach ($comparison in $field.Comparisons) {
         $wave=$byStage['generator.waveform']
         if ($generatorInput.Count -ne $generatorInput.Extent * 512 -or $wave.Count -ne 300 * $generatorInput.Extent) {
             throw 'Generator input is not 512 channels on the 80 Hz clock.'
+        }
+        if ($VerifyHandoff) {
+            $handoff = $execution.DecoderHandoff
+            if (![object]::ReferenceEquals($handoff.GeneratorFeatures,$generatorInput) -or
+                ![object]::ReferenceEquals($handoff.AlignedText,$byStage['text_encoder.aligned']) -or
+                ![object]::ReferenceEquals($handoff.DecoderInput,$byStage['decoder.module.encode.norm1.input'])) {
+                throw 'Handoff replaced a canonical activation.'
+            }
+            $null = $providence.Register($handoff,'',$teacher.Document.Source.EvidenceGroup)
+            $question = $providence.Require($handoff,[StudentDecoderHandoffBearing],'Compare the retained input buffers across the decoder handoff')
+            $providence.PreferFocused = $true
+            $null = $providence.Advance(1)
+            $comparisonResult = $question.Resolution
+            if (!$comparisonResult -or $comparisonResult.Status -ne [StudentDecoderHandoffStatus]::Agreement) {
+                throw "Decoder handoff comparison failed for $($teacher.Start): $($comparisonResult.Status)."
+            }
+            "Handoff $($teacher.Start) $($handoff.Pitch.Stage) decoder=$($handoff.DecoderInput.Extent) generator=$($handoff.GeneratorFeatures.Extent) packed=$($comparisonResult.DecoderInputMatches) F0=$($comparisonResult.SourcePitchMatches)"
         }
         $generatorClock=$generatorInput.FrameClock()
         $stftClock=$byStage['generator.source.stft'].FrameClock()
@@ -93,6 +116,14 @@ foreach ($comparison in $field.Comparisons) {
             foreach ($activation in $experiment.Outcome.Activations) {
                 if ($checked.Add("$($activation.TypeCode):$($activation.Checksum)")) { $null=$activation.Read() }
             }
+        }
+        if ($VerifyHandoff) {
+            $baseline = $experiment.Baseline.DecoderHandoff
+            $outcome = $experiment.Outcome.DecoderHandoff
+            if ($baseline.DecoderInput.Checksum -cne $outcome.DecoderInput.Checksum -or
+                $baseline.GeneratorFeatures.Checksum -cne $outcome.GeneratorFeatures.Checksum -or
+                $baseline.GeneratorPitch.Checksum -cne $outcome.GeneratorPitch.Checksum -or
+                !$experiment.ChangedWaveform()) { throw 'Residual intervention does not preserve the expected handoff counterexample.' }
         }
         "source=$($teacher.Document.Source.Id) offset=$($teacher.Start) residual=$($experiment.Site) waveformChanged=$($experiment.ChangedWaveform()) baselineInput=$($experiment.Baseline.GeneratorInput.Checksum)"
     }

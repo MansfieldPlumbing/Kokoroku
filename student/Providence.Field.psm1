@@ -297,6 +297,16 @@ class ProvidenceField {
                     return $this.QualifiedKey($o.Execution,$suggested)+'/token-clock'
                 }
             }
+            'StudentDecoderHandoff' {
+                if ($o.Execution -and $o.Execution.Teacher.Document.Source) {
+                    return $this.QualifiedKey($o.Execution,$suggested)+'/decoder-handoff'
+                }
+            }
+            'StudentDecoderHandoffBearing' {
+                if ($o.Handoff -and $o.Handoff.Execution.Teacher.Document.Source) {
+                    return $this.QualifiedKey($o.Handoff,$suggested)+'/input-comparison'
+                }
+            }
             'StudentNormalizationClockBearing' {
                 if ($o.Scope -and $o.Scope.Execution.Teacher.Document.Source) {
                     return $this.QualifiedKey($o.Scope,$suggested)+'/token-scope'

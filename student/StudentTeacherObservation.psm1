@@ -62,6 +62,7 @@ class StudentStockExecution {
     [StudentAlbertApplication[]] $AlbertApplications
     [StudentStockConvolution[]] $Convolutions
     [StudentStockActivation] $GeneratorInput
+    [StudentDecoderHandoff] $DecoderHandoff
     [StudentStockActivation] $Waveform
     [StudentStockExecution] $FrontStateReplay
 
@@ -118,6 +119,74 @@ class StudentStockExecution {
                 }
             }
         }
+        return $result
+    }
+}
+
+enum StudentDecoderHandoffStatus { MissingStages; IncompatibleShape; Contradiction; Agreement }
+
+class StudentDecoderHandoffBearing {
+    [StudentDecoderHandoff] $Handoff
+    [StudentDecoderHandoffStatus] $Status
+    [bool] $DecoderInputMatches
+    [bool] $SourcePitchMatches
+}
+
+class StudentDecoderHandoff {
+    [StudentStockExecution] $Execution
+    [StudentStockActivation] $AlignedText
+    [StudentStockActivation] $Pitch
+    [StudentStockActivation] $Noise
+    [StudentStockActivation] $AcousticStyle
+    [StudentStockActivation] $DecoderPitch
+    [StudentStockActivation] $DecoderNoise
+    [StudentStockActivation] $DecoderInput
+    [StudentStockActivation] $GeneratorFeatures
+    [StudentStockActivation] $GeneratorPitch
+    [StudentStockActivation] $UniformDraw
+    [StudentStockActivation] $HarmonicDraw
+    [StudentStockActivation] $ExtraDraw
+
+    [StudentDecoderHandoffBearing] ObserveInputs() {
+        $result = [StudentDecoderHandoffBearing]@{ Handoff = $this; Status = [StudentDecoderHandoffStatus]::MissingStages }
+        foreach ($activation in $this.AlignedText,$this.Pitch,$this.Noise,$this.AcousticStyle,$this.DecoderPitch,
+            $this.DecoderNoise,$this.DecoderInput,$this.GeneratorFeatures,$this.GeneratorPitch,
+            $this.UniformDraw,$this.HarmonicDraw,$this.ExtraDraw) {
+            if (!$activation) { return $result }
+            if ($activation.TypeCode -ne 1 -or ![object]::ReferenceEquals($activation.Execution,$this.Execution)) {
+                $result.Status = [StudentDecoderHandoffStatus]::IncompatibleShape
+                return $result
+            }
+        }
+        $frames = $this.AlignedText.Extent
+        $ticks = $this.GeneratorFeatures.Extent
+        $result.Status = [StudentDecoderHandoffStatus]::IncompatibleShape
+        if ($ticks -ne 2L*$frames -or $this.AlignedText.Count -ne 512L*$frames -or
+            $this.DecoderInput.Extent -ne $frames -or $this.DecoderInput.Count -ne 514L*$frames -or
+            $this.DecoderPitch.Extent -ne $frames -or $this.DecoderPitch.Count -ne $frames -or
+            $this.DecoderNoise.Extent -ne $frames -or $this.DecoderNoise.Count -ne $frames -or
+            $this.Pitch.Extent -ne $ticks -or $this.Pitch.Count -ne $ticks -or
+            $this.Noise.Extent -ne $ticks -or $this.Noise.Count -ne $ticks -or
+            $this.GeneratorPitch.Extent -ne $ticks -or $this.GeneratorPitch.Count -ne $ticks -or
+            $this.AcousticStyle.Count -ne 128 -or $this.GeneratorFeatures.Count -ne 512L*$ticks -or
+            $this.UniformDraw.Count -ne 9 -or $this.ExtraDraw.Count -ne 300L*$ticks -or
+            $this.HarmonicDraw.Count -ne 9L*$this.ExtraDraw.Count) { return $result }
+
+        # Hash the channel-major concatenation recorded at the decoder's first
+        # normalization site. Read() checks each constituent payload first.
+        $bytes = [byte[]]::new(4*$this.DecoderInput.Count)
+        $offset = 0
+        foreach ($part in $this.AlignedText,$this.DecoderPitch,$this.DecoderNoise) {
+            $values = $part.Read()
+            $length = [Buffer]::ByteLength($values)
+            [Buffer]::BlockCopy($values,0,$bytes,$offset,$length)
+            $offset += $length
+        }
+        $result.DecoderInputMatches = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) -ceq $this.DecoderInput.Checksum
+        $result.SourcePitchMatches = $this.Pitch.Checksum -ceq $this.GeneratorPitch.Checksum
+        $result.Status = if ($result.DecoderInputMatches -and $result.SourcePitchMatches) {
+            [StudentDecoderHandoffStatus]::Agreement
+        } else { [StudentDecoderHandoffStatus]::Contradiction }
         return $result
     }
 }
@@ -406,6 +475,27 @@ function Open-StudentStockExecution([StudentTeacherObservation] $Teacher,[string
         if ($r.BaseStream.Position -ne $r.BaseStream.Length) { throw 'Unexpected execution index data.' }
         $execution.GeneratorInput=$stages['decoder.generator_input']
         $execution.Waveform=$stages['generator.waveform']
+        if ($execution.GeneratorInput) {
+            $pitch = $stages['procedural.f0']
+            $noise = $stages['procedural.n']
+            if (!$pitch) { $pitch = $stages['predictor.module.F0_proj'] }
+            if (!$noise) { $noise = $stages['predictor.module.N_proj'] }
+            $execution.DecoderHandoff = [StudentDecoderHandoff]@{
+                Execution = $execution
+                AlignedText = $stages['text_encoder.aligned']
+                Pitch = $pitch
+                Noise = $noise
+                AcousticStyle = $stages['speech.style']
+                DecoderPitch = $stages['decoder.module.F0_conv']
+                DecoderNoise = $stages['decoder.module.N_conv']
+                DecoderInput = $stages['decoder.module.encode.norm1.input']
+                GeneratorFeatures = $execution.GeneratorInput
+                GeneratorPitch = $stages['generator.source.f0']
+                UniformDraw = $stages['generator.source.uniform_draw']
+                HarmonicDraw = $stages['generator.source.harmonic_draw']
+                ExtraDraw = $stages['generator.source.extra_draw']
+            }
+        }
         $execution.Convolutions=@(foreach ($a in $execution.Activations) {
             if ($a.Axes -cne 'inputFrames,inputChannels,outputChannels,kernel,stride,padding,dilation,groups,transpose,outputPadding') { continue }
             $conv=[StudentStockConvolution]::new()
@@ -660,6 +750,7 @@ function Get-StudentStockObservationMethod {
     param()
     [StudentStockExecution].GetMethod('ObserveTokenClock',[type[]]@())
     [StudentStockNormalization].GetMethod('ObserveTokenScope',[type[]]@([StudentExecutionClockBearing]))
+    [StudentDecoderHandoff].GetMethod('ObserveInputs',[type[]]@())
 }
 
 function Write-StudentStockScopeRecord {
