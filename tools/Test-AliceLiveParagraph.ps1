@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 # Test-AliceLiveParagraph.ps1
 # End-to-end synthesis of the full Alice paragraph:
 # Text -> Compiled English Phonemizer -> DSP Decoder (512-ch features + F0)

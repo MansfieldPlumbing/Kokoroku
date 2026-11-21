@@ -1,6 +1,6 @@
 using module ./StudentTeacherObservation.psm1
 using module ./Providence.Field.psm1
-#requires -Version 7.7
+#requires -Version 7.4
 param(
     [string] $BankPath=(Join-Path $PSScriptRoot '../data/source-bank'),
     [string] $SourceIdentity='Gutenberg/11',

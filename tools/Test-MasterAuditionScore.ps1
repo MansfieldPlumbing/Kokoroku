@@ -1,4 +1,4 @@
-﻿#requires -Version 7.7
+#requires -Version 7.4
 # Test-MasterAuditionScore.ps1
 # Renders the Master Audition performance score under Baseline vs. Performed Score
 # with Pinned VoiceBase AdaIN, measuring raw physical telemetry and playing on OnePlus 11.

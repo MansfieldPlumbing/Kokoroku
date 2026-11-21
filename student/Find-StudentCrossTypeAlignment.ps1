@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 
 param([Parameter(Mandatory)] $Speech, [ValidateRange(1,32)][int] $MemoryLimitGiB = 4)
 

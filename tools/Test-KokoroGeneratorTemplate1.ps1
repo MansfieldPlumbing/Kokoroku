@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 using namespace System.Linq.Expressions
 using namespace System.Runtime.Intrinsics
 [CmdletBinding()]

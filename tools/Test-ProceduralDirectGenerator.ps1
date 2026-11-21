@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 # Test-ProceduralDirectGenerator.ps1
 # Direct Procedural Generator Test:
 # Validates synthesizing speech directly into 512-channel x using

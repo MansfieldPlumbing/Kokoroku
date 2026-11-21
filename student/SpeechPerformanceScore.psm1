@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 # Canonical Speech Performance Score and Gesture Types
 # Follows NIST / PowerShell / CoreCLR conventions without ad hoc C# compilation.
 

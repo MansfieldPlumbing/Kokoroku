@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 # Physical Controller Adapter for Kokoro Performance Score
 # Maps controller stick/trigger/gyro axes and buttons into typed SpeechScoreEvents
 # compatible with the 12-byte layout in Invoke-Student.ps1 and MIDI 2.0 UMP.

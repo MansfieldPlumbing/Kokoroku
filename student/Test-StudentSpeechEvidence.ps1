@@ -1,5 +1,5 @@
 using module ./StudentTeacherObservation.psm1
-#requires -Version 7.7
+#requires -Version 7.4
 param([string] $BankPath=(Join-Path $PSScriptRoot '../data/source-bank'))
 $ErrorActionPreference='Stop'
 $investigation=& "$PSScriptRoot/Invoke-Student.ps1" -Step SpeechEvidence -Corpus $BankPath

@@ -72,7 +72,7 @@ Show help without compiling, loading weights or rendering.
 & ./Invoke-KokoroDevelopment.ps1 PrecomputedDecoder -Parameters @{Mode='Speech'; Text='Text to render.'; CompareConvolution=$true}
 #>
 
-#requires -Version 7.7
+#requires -Version 7.4
 using namespace System.Runtime.Intrinsics
 [CmdletBinding()]
 param(

@@ -1,7 +1,7 @@
 using module ./StudentSourceInventory.psm1
 using module ./StudentTextEvidence.psm1
 using module ./StudentTeacherObservation.psm1
-#requires -Version 7.7
+#requires -Version 7.4
 param(
     [string] $BankPath=(Join-Path $PSScriptRoot '../data/source-bank'),
     [ValidateRange(0,1000000)][int] $Limit=0,

@@ -1,4 +1,4 @@
-#requires -Version 7.7
+#requires -Version 7.4
 # MIDI 2.0 Universal MIDI Packet (UMP) Codec for Speech Performance Scores
 # Implements 32-bit and 64-bit UMP packet serialization/deserialization.
 # Uses MIDI 2.0 Channel Voice (CV) message type 0x4 (64-bit UMP) for standard note/pitch-bend,

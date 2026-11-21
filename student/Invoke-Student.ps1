@@ -79,7 +79,7 @@ Worker threads for the syllabus's kernels.
 Run from a PowerShell prompt: pwsh -File passes every argument as a string, so a
 -Parameters hashtable only works in process.
 #>
-#requires -Version 7.7
+#requires -Version 7.4
 [CmdletBinding()]
 param(
     [ValidateSet('Console', 'Render', 'Corpus', 'Sources', 'VerifySources', 'Votes', 'VerifyVotes', 'Pronunciation', 'Normalize', 'Compose', 'VerifyComposition', 'Morphology', 'VerifyMorphology', 'Syllabus', 'Recordings', 'Listen', 'Stems', 'Alignment', 'SpeechEvidence', 'Percepts', 'Describe', 'Learn', 'Hunt', 'RetainedField', 'Audit', 'Discriminate', 'Reconsider', 'Inventory', 'Speak', 'Ablate', 'PitchGate', 'Trace', 'Normalization', 'Score', 'Residuals', 'Retune')][string] $Step = 'Console',

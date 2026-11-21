@@ -1,5 +1,5 @@
 using module ./StudentSourceInventory.psm1
-#requires -Version 7.7
+#requires -Version 7.4
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $Decoder,
