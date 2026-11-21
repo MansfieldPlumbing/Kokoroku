@@ -48,6 +48,9 @@ try {
     }elseif($CapabilityArchive){
         Import-ProvidenceField -Path $CapabilityArchive -CapabilitiesOnly
     }else{New-ProvidenceField}
+    foreach ($method in Get-StudentStockObservationMethod) {
+        $field.PublishObservation($method)
+    }
     $sources=@($speech.Inventory.Units.Values)
     $comparisons=@($speech.Comparisons)
     $executions=@($speech.Executions)

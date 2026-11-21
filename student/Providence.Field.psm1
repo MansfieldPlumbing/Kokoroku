@@ -118,6 +118,8 @@ class ProvidenceCapability {
     [type] $InputType
     [type] $OutputType
     [PropertyInfo[]] $Path = @()
+    [MethodInfo] $Method
+    [MethodInfo] $ArgumentMethod
     [string[]] $Dependencies = @()
     [string] $Kind = 'ReflectedMember'
     [bool] $Valid = $true
@@ -141,6 +143,8 @@ class ProvidenceField {
     [int] $MaxCapabilities = 6000
     [long] $MaxReferents = 250000
     [Dictionary[string,ProvidenceCapability]] $Capabilities = [Dictionary[string,ProvidenceCapability]]::new([StringComparer]::Ordinal)
+    [HashSet[MethodInfo]] $ObservationMethods = [HashSet[MethodInfo]]::new()
+    [Dictionary[object,HashSet[string]]] $ObservationBindings = [Dictionary[object,HashSet[string]]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
     [Dictionary[string,ProvidenceReverie]] $Reveries = [Dictionary[string,ProvidenceReverie]]::new([StringComparer]::Ordinal)
     [Dictionary[object,List[ProvidenceReverie]]] $RequirementsByOwner = [Dictionary[object,List[ProvidenceReverie]]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
     [Dictionary[string,ProvidencePercept]] $Percepts = [Dictionary[string,ProvidencePercept]]::new([StringComparer]::Ordinal)
@@ -202,6 +206,21 @@ class ProvidenceField {
                     return 'activation/'+$o.Execution.Teacher.Document.Source.Id+'/'+
                         $o.Execution.Teacher.Start+'/'+$o.Execution.Teacher.Length+'/'+
                         $o.Execution.Recipe+'/'+$o.Stage+'/'+$o.Axes+'/'+$o.Checksum
+                }
+            }
+            'StudentStockNormalization' {
+                if ($o.Execution -and $o.Execution.Teacher.Document.Source) {
+                    return $this.QualifiedKey($o.Execution,$suggested)+'/normalization/'+$o.Site
+                }
+            }
+            'StudentExecutionClockBearing' {
+                if ($o.Execution -and $o.Execution.Teacher.Document.Source) {
+                    return $this.QualifiedKey($o.Execution,$suggested)+'/token-clock'
+                }
+            }
+            'StudentNormalizationClockBearing' {
+                if ($o.Scope -and $o.Scope.Execution.Teacher.Document.Source) {
+                    return $this.QualifiedKey($o.Scope,$suggested)+'/token-scope'
                 }
             }
         }
@@ -309,7 +328,17 @@ class ProvidenceField {
         $cap=$null
         if (!$this.Capabilities.TryGetValue($key,[ref]$cap) -or !$cap.Valid) { return }
         if (!$cap.InputType.IsAssignableFrom($referent.GetType())) { return }
-        if ($cap.Depth -gt 1) {
+        if ($cap.Kind -ceq 'ObservationMethod') {
+            $bindings = $null
+            if (!$cap.Method -or !$this.ObservationBindings.TryGetValue($referent,[ref]$bindings) -or !$bindings.Contains($key)) { return }
+            $relationships = $null
+            if ($this.RelationshipsByOwner.TryGetValue($this.ObjectKey($referent),[ref]$relationships)) {
+                foreach ($relationship in $relationships) {
+                    if ($relationship.Referent -and $key -cin $relationship.Bearings.CapabilityKey) { return }
+                }
+            }
+        }
+        if ($cap.Method -or $cap.Kind -ceq 'ObservationMethod' -or $cap.Depth -gt 1) {
             $requirements=$null
             if (!$this.RequirementsByOwner.TryGetValue($referent,[ref]$requirements)) { return }
             $applicable=$false
@@ -343,7 +372,7 @@ class ProvidenceField {
         }
         # Compose typed property paths only after both constituents exist as actual
         # observed CLR operations. No named clock, morphology, or model target.
-        if ($cap.Depth -ge $this.MaxDepth) { return }
+        if ($cap.Method -or $cap.Depth -ge $this.MaxDepth) { return }
         $existing=[ProvidenceCapability[]]@($this.Capabilities.Values)
         foreach ($other in $existing) {
             if ($other.Key -ceq $cap.Key) { continue }
@@ -354,6 +383,7 @@ class ProvidenceField {
         }
     }
     [void] TryCompose([ProvidenceCapability]$first,[ProvidenceCapability]$second) {
+        if ($first.Kind -ceq 'ObservationMethod' -or $second.Kind -ceq 'ObservationMethod') { return }
         if (!$first.ObservedOnRealReferent -or !$second.ObservedOnRealReferent -or !$first.Valid -or !$second.Valid) { return }
         if ($first.Depth + $second.Depth -gt $this.MaxDepth) { return }
         $path = [PropertyInfo[]]@($first.Path + $second.Path)
@@ -366,6 +396,91 @@ class ProvidenceField {
         $composed.Dependencies=[string[]]@($first.Key,$second.Key)
         $this.AcquiredCompositions++
         $this.IntroduceCapability($composed)
+    }
+
+    [void] PublishObservation([MethodInfo] $method) {
+        if (!$method -or !$method.IsPublic -or $method.IsStatic -or $method.ContainsGenericParameters -or
+            !$this.IsReferenceType($method.ReturnType) -or $method.GetParameters().Length -gt 1) {
+            throw 'Expected a public, typed observation method with at most one argument.'
+        }
+        if (!$this.ObservationMethods.Add($method)) { return }
+        foreach ($requirement in $this.Reveries.Values) {
+            if ($requirement.Owner -and $requirement.NeededType) { $this.FindObservation($requirement) }
+        }
+    }
+
+    [void] FindObservation([ProvidenceReverie] $requirement) {
+        $receiverType = $requirement.Owner.GetType()
+        foreach ($method in $this.ObservationMethods) {
+            if (!$method.DeclaringType.IsAssignableFrom($receiverType) -or
+                !$requirement.NeededType.IsAssignableFrom($method.ReturnType)) { continue }
+            $parameters = $method.GetParameters()
+            if (!$parameters.Length) {
+                $this.BindObservation($requirement.Owner,$method,$null,$null)
+                continue
+            }
+            # The argument is produced from an object reached directly from the
+            # receiver. A clock on another execution is never an argument candidate.
+            $routes = [List[ProvidenceCapability]]::new()
+            foreach ($property in $receiverType.GetProperties([BindingFlags]'Public,Instance')) {
+                if (!$property.CanRead -or $property.GetIndexParameters().Length) { continue }
+                foreach ($factory in $this.ObservationMethods) {
+                    if ($factory.GetParameters().Length -or !$factory.DeclaringType.IsAssignableFrom($property.PropertyType) -or
+                        !$parameters[0].ParameterType.IsAssignableFrom($factory.ReturnType) -or !$property.GetValue($requirement.Owner)) { continue }
+                    $route = [ProvidenceCapability]::new()
+                    $route.Path = @($property)
+                    $route.ArgumentMethod = $factory
+                    $routes.Add($route)
+                }
+            }
+            if ($routes.Count -eq 1) {
+                $this.BindObservation($requirement.Owner,$method,$routes[0].Path[0],$routes[0].ArgumentMethod)
+            }
+        }
+    }
+
+    [string] ObservationKey([MethodInfo] $method,[PropertyInfo] $route,[MethodInfo] $factory) {
+        $key = 'OBSERVE/'+$method.DeclaringType.FullName+'/'+$method.Name+'/'+$method.ReturnType.FullName
+        if ($route) { $key += '/'+$method.GetParameters()[0].ParameterType.FullName+'/'+$route.Name+'/'+$factory.DeclaringType.FullName+'/'+$factory.Name }
+        return $key
+    }
+
+    [void] BindObservation([object] $owner,[MethodInfo] $method,[PropertyInfo] $route,[MethodInfo] $factory) {
+        $key = $this.ObservationKey($method,$route,$factory)
+        $dependency = ''
+        if ($route) {
+            $argumentOwner = $route.GetValue($owner)
+            if (!$argumentOwner) { return }
+            $null = $this.Register($argumentOwner,$this.ObjectKey($owner)+'/argument-owner',$this.Families[$owner])
+            $dependency = $this.ObservationKey($factory,$null,$null)
+            $this.BindObservation($argumentOwner,$factory,$null,$null)
+            if (!$this.Capabilities.ContainsKey($dependency)) { return }
+        }
+        $operation = $null
+        if (!$this.Capabilities.TryGetValue($key,[ref]$operation)) {
+            $operation = [ProvidenceCapability]::new()
+            $operation.Key=$key
+            $operation.InputType=$method.DeclaringType
+            $operation.OutputType=$method.ReturnType
+            $operation.Kind='ObservationMethod'
+            $operation.Method=$method
+            $operation.ArgumentMethod=$factory
+            if ($route) {
+                $operation.Path=@($route)
+                $operation.Dependencies=@($dependency)
+                $operation.Valid=$this.Capabilities[$dependency].Valid
+            }
+            $this.IntroduceCapability($operation)
+            if (!$this.Capabilities.ContainsKey($key)) { return }
+        } else {
+            $operation.Method=$method
+            $operation.ArgumentMethod=$factory
+        }
+        if (!$this.ObservationBindings.ContainsKey($owner)) {
+            $this.ObservationBindings.Add($owner,[HashSet[string]]::new([StringComparer]::Ordinal))
+        }
+        $null = $this.ObservationBindings[$owner].Add($key)
+        $this.Schedule($owner,$key)
     }
     [void] Inspect([object]$owner) {
         $type=$owner.GetType()
@@ -404,10 +519,28 @@ class ProvidenceField {
     [void] Execute([ProvidenceWork]$work) {
         $cap=$null
         if (!$this.Capabilities.TryGetValue($work.CapabilityKey,[ref]$cap) -or !$cap.Valid) { return }
+        if ($cap.Kind -ceq 'ObservationMethod' -and !$cap.Method) { return }
         $watch=[Diagnostics.Stopwatch]::StartNew()
         try {
             $nodes=[object[]]@($work.Referent)
-            foreach ($property in $cap.Path) {
+            if ($cap.Method) {
+                $arguments = [object[]]@()
+                if ($cap.ArgumentMethod) {
+                    $argumentOwner = $cap.Path[0].GetValue($work.Referent)
+                    if (!$argumentOwner) { return }
+                    $null = $this.Register($argumentOwner,$this.ObjectKey($work.Referent)+'/argument-owner',$this.Families[$work.Referent])
+                    $this.ActualCalls++
+                    $argument = $cap.ArgumentMethod.Invoke($argumentOwner,$null)
+                    if (!$argument) { return }
+                    $argumentKey = $this.QualifiedKey($argument,$this.ObjectKey($work.Referent)+'/argument')
+                    if ($this.ByKey.ContainsKey($argumentKey)) { $argument = $this.ByKey[$argumentKey] }
+                    else { $null = $this.Register($argument,$argumentKey,$this.Families[$work.Referent]) }
+                    $arguments = [object[]]@($argument)
+                }
+                $result = $cap.Method.Invoke($work.Referent,$arguments)
+                $nodes = if ($result) { @($result) } else { @() }
+            }
+            foreach ($property in $(if (!$cap.Method) { $cap.Path })) {
                 $next=[List[object]]::new()
                 $seen=[HashSet[object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
                 foreach ($node in $nodes) {
@@ -442,6 +575,10 @@ class ProvidenceField {
             $index=0
             foreach ($result in $nodes) {
                 $id=$ownerKey+'/'+$cap.Key+'['+$index+']'
+                if ($cap.Method) {
+                    $resultKey = $this.QualifiedKey($result,$id)
+                    if ($this.ByKey.ContainsKey($resultKey)) { $result = $this.ByKey[$resultKey] }
+                }
                 $null=$this.Register($result,$id,$family)
                 $targetKey=$this.ObjectKey($result)
                 $relationKey=$ownerKey+' => '+$targetKey
@@ -555,6 +692,7 @@ class ProvidenceField {
         }
         $this.RequirementsByOwner[$owner].Add($r)
         $this.ReconsiderOwner($owner)
+        $this.FindObservation($r)
         foreach($c in $this.Capabilities.Values){
             if($c.Valid -and $c.InputType.IsAssignableFrom($owner.GetType()) -and
                 $neededType.IsAssignableFrom($c.OutputType)){$this.Schedule($owner,$c.Key)}
@@ -597,7 +735,7 @@ function Save-ProvidenceField {
     $tmp=$full+'.'+[guid]::NewGuid().ToString('N')+'.partial'
     $writer=[IO.BinaryWriter]::new([IO.File]::Open($tmp,[IO.FileMode]::CreateNew))
     try {
-        $writer.Write('Providence-StructuralField/3')
+        $writer.Write('Providence-StructuralField/4')
         $writer.Write($Field.FileObservations.Count)
         foreach($entry in $Field.FileObservations.GetEnumerator()){$writer.Write($entry.Key);$writer.Write($entry.Value)}
         $writer.Write($Field.Capabilities.Count)
@@ -608,6 +746,7 @@ function Save-ProvidenceField {
             $writer.Write($cap.Path.Length)
             foreach($member in $cap.Path){$writer.Write($member.DeclaringType.FullName);$writer.Write($member.Name)}
             $writer.Write($cap.Valid);$writer.Write($cap.ObservedOnRealReferent);$writer.Write($cap.Suspended)
+            $writer.Write($cap.Kind)
             $writer.Write($cap.Applications);$writer.Write($cap.Successful);$writer.Write($cap.Failures);$writer.Write($cap.ElapsedTicks)
             $writer.Write($cap.Dependencies.Length)
             foreach($depend in $cap.Dependencies){$writer.Write($depend)}
@@ -658,7 +797,7 @@ function Import-ProvidenceField {
     $reader=[IO.BinaryReader]::new([IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).Path))
     try {
         $schema = $reader.ReadString()
-        if($schema -cnotin 'Providence-StructuralField/2','Providence-StructuralField/3'){
+        if($schema -cnotin 'Providence-StructuralField/2','Providence-StructuralField/3','Providence-StructuralField/4'){
             throw 'Unsupported field version; do not silently flatten or discard prior evidence'
         }
         $files=$reader.ReadInt32()
@@ -677,8 +816,9 @@ function Import-ProvidenceField {
             }
             $c.Path=$members.ToArray();$c.Depth=$c.Path.Count
             $c.Valid=$reader.ReadBoolean();$c.ObservedOnRealReferent=$reader.ReadBoolean()
-            if ($schema -ceq 'Providence-StructuralField/3') { $c.Suspended=$reader.ReadBoolean() }
+            if ($schema -cne 'Providence-StructuralField/2') { $c.Suspended=$reader.ReadBoolean() }
             else { $c.Suspended = !$c.Valid }
+            if ($schema -ceq 'Providence-StructuralField/4') { $c.Kind=$reader.ReadString() }
             $c.Applications=$reader.ReadInt64();$c.Successful=$reader.ReadInt64()
             $c.Failures=$reader.ReadInt64();$c.ElapsedTicks=$reader.ReadInt64()
             $deps=$reader.ReadInt32();$c.Dependencies=[string[]]@(for($j=0;$j -lt $deps;$j++){$reader.ReadString()})
@@ -701,7 +841,7 @@ function Import-ProvidenceField {
             for($j=0;$j -lt $evidence;$j++){
                 $b=[ProvidenceBearing]::new();$b.OwnerKey=$p.OwnerKey;$b.ReferentKey=$p.ReferentKey
                 $b.CapabilityKey=$reader.ReadString();$b.SourceFamily=$reader.ReadString();$b.Valid=$reader.ReadBoolean()
-                if ($schema -ceq 'Providence-StructuralField/3') { $b.ObservedAt=[datetime]::FromBinary($reader.ReadInt64()) }
+                if ($schema -cne 'Providence-StructuralField/2') { $b.ObservedAt=[datetime]::FromBinary($reader.ReadInt64()) }
                 $p.Bearings.Add($b)
             }
             $field.Percepts[$p.Key]=$p
@@ -719,7 +859,7 @@ function Import-ProvidenceField {
             $r.ResolutionCapability=$reader.ReadString()
             $typeName=$reader.ReadString()
             if($typeName){$r.NeededType=Resolve-ProvidenceType $typeName}
-            if ($schema -ceq 'Providence-StructuralField/3') {
+            if ($schema -cne 'Providence-StructuralField/2') {
                 $count = $reader.ReadInt32()
                 for ($j=0;$j -lt $count;$j++) {
                     $judgment = [ProvidenceReverieJudgment]::new()

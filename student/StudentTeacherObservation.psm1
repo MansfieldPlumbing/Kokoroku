@@ -655,4 +655,81 @@ function Open-StudentTeacherObservation {
         $item
     } finally { $r.Dispose() }
 }
-Export-ModuleMember -Function Open-StudentTeacherObservation,Measure-StudentTeacherWave,Get-StudentStockBufferRoots
+function Get-StudentStockObservationMethod {
+    [OutputType([Reflection.MethodInfo])]
+    param()
+    [StudentStockExecution].GetMethod('ObserveTokenClock',[type[]]@())
+    [StudentStockNormalization].GetMethod('ObserveTokenScope',[type[]]@([StudentExecutionClockBearing]))
+}
+
+function Write-StudentStockScopeRecord {
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][StudentNormalizationClockBearing] $Observation,
+        [Parameter(Mandatory)][string] $Reason
+    )
+    $scope = $Observation.Scope
+    $execution = $scope.Execution
+    $teacher = $execution.Teacher
+    if (![object]::ReferenceEquals($execution,$teacher.StockExecution) -or
+        ![object]::ReferenceEquals($execution,$Observation.TokenClock.Execution) -or
+        $Observation.TokenClock.Status -ne [StudentExecutionClockStatus]::Agreement -or !$scope.TokenFrames) {
+        throw 'This record requires a retained stock token clock and captured token-frame counts.'
+    }
+    $recipe = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($execution.Recipe)))
+    $words = @($teacher.Document.Source.Id,[string]$teacher.Start,[string]$teacher.Length,$recipe,
+        $scope.Site,$scope.TokenFrames.Checksum,$Observation.Status.ToString(),
+        [string]$Observation.FirstConflictingToken,$Reason)
+    $literals = foreach ($word in $words) { "'" + $word.Replace("'","''") + "'" }
+    $line = 'ObservedStockScope ' + ($literals -join ' ')
+    if ($line.IndexOfAny([char[]]@([char]10,[char]13)) -ge 0) { throw 'A scope record occupies one line.' }
+    return $line
+}
+
+function Read-StudentStockScopeRecord {
+    [OutputType([StudentNormalizationClockBearing])]
+    param(
+        [Parameter(Mandatory)][string] $Line,
+        [Parameter(Mandatory)][StudentStockExecution] $Execution
+    )
+    $teacher = $Execution.Teacher
+    if (![object]::ReferenceEquals($Execution,$teacher.StockExecution)) { throw 'Expected the canonical stock execution.' }
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Line,[ref]$null,[ref]$errors)
+    if ($errors.Count -or $ast.EndBlock.Statements.Count -ne 1 -or
+        $ast.EndBlock.Statements[0] -isnot [Management.Automation.Language.PipelineAst] -or
+        $ast.EndBlock.Statements[0].PipelineElements.Count -ne 1) { throw 'Invalid stock scope record.' }
+    $command = $ast.EndBlock.Statements[0].PipelineElements[0]
+    if ($command -isnot [Management.Automation.Language.CommandAst] -or $command.GetCommandName() -cne 'ObservedStockScope' -or
+        $command.CommandElements.Count -ne 10 -or $command.Redirections.Count -or
+        $command.InvocationOperator -ne [Management.Automation.Language.TokenKind]::Unknown) { throw 'Invalid stock scope declaration.' }
+    $values = foreach ($argument in $command.CommandElements | Select-Object -Skip 1) {
+        if ($argument -isnot [Management.Automation.Language.StringConstantExpressionAst] -or
+            $argument.StringConstantType -ne [Management.Automation.Language.StringConstantType]::SingleQuoted) {
+            throw 'Stock scope record fields must be literal strings.'
+        }
+        $argument.Value
+    }
+    $recipe = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Execution.Recipe)))
+    if ($values[0] -cne $teacher.Document.Source.Id -or $values[1] -cne [string]$teacher.Start -or
+        $values[2] -cne [string]$teacher.Length -or $values[3] -cne $recipe) { throw 'Stock scope record refers to another execution.' }
+    $matches = @($Execution.Normalizations | Where-Object Site -CEQ $values[4])
+    if ($matches.Count -ne 1 -or !$matches[0].TokenFrames -or $matches[0].TokenFrames.Checksum -cne $values[5]) {
+        throw 'Captured normalization scope does not match the record.'
+    }
+    $scope = $matches[0]
+    if ($values[6] -cnotin [Enum]::GetNames([StudentExecutionClockStatus])) { throw 'Unknown scope judgment.' }
+    # Restore the saved outcome over the canonical retained observations. The
+    # two observation methods are deliberately outside this reconstruction.
+    $clock = [StudentExecutionClockBearing]@{
+        Execution = $Execution; Durations = $Execution.DurationActivation()
+        TokenTicks = $teacher.StockTokenTickStarts; Status = [StudentExecutionClockStatus]::Agreement
+    }
+    [StudentNormalizationClockBearing]@{
+        Scope = $scope; TokenClock = $clock; FrameClock = $scope.Input.FrameClock()
+        CapturedFrames = [int[]]$scope.TokenFrames.Read()
+        Status = [StudentExecutionClockStatus]$values[6]; FirstConflictingToken = [int]$values[7]
+    }
+}
+
+Export-ModuleMember -Function Open-StudentTeacherObservation,Measure-StudentTeacherWave,Get-StudentStockBufferRoots,Get-StudentStockObservationMethod,Write-StudentStockScopeRecord,Read-StudentStockScopeRecord
