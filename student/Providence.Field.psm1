@@ -39,6 +39,13 @@ class ProvidencePercept {
         if ($this.Reliance -cne $next) { $this.Reliance=$next; $this.Version++ }
     }
 }
+class ProvidenceReverieJudgment {
+    [long] $Version
+    [datetime] $ObservedAt
+    [string] $Status
+    [string[]] $CandidateKeys
+    [string] $ResolutionCapability
+}
 class ProvidenceReverie {
     [string] $Key
     [string] $OwnerKey
@@ -50,6 +57,61 @@ class ProvidenceReverie {
     [object] $Resolution
     [string] $ResolutionCapability
     [long] $Version = 0
+    [ProvidencePercept[]] $Alternatives = @()
+    [List[ProvidenceReverieJudgment]] $History = [List[ProvidenceReverieJudgment]]::new()
+
+    [void] Reconsider([List[ProvidencePercept]] $relationships, [Dictionary[string,ProvidenceCapability]] $capabilities) {
+        $candidates = [List[ProvidencePercept]]::new()
+        $supported = [List[ProvidencePercept]]::new()
+        $nextCapability = ''
+        $unbound = $false
+        foreach ($relationship in $relationships) {
+            if ($relationship.Referent) {
+                if (!$this.NeededType.IsInstanceOfType($relationship.Referent)) { continue }
+                $candidates.Add($relationship)
+            }
+            foreach ($bearing in $relationship.Bearings) {
+                $operation = $null
+                if ($capabilities.TryGetValue($bearing.CapabilityKey,[ref]$operation) -and $operation.Valid) {
+                    if (!$relationship.Referent) {
+                        if ($this.NeededType.IsAssignableFrom($operation.OutputType) -or
+                            $operation.OutputType.IsAssignableFrom($this.NeededType)) { $unbound = $true }
+                        continue
+                    }
+                    $supported.Add($relationship)
+                    if (!$nextCapability) { $nextCapability = $operation.Key }
+                    break
+                }
+            }
+        }
+        $this.Alternatives = $candidates.ToArray()
+        $nextStatus = 'Blocked'
+        $nextResolution = $null
+        if ($unbound) {
+            $nextStatus = 'Unbound'
+        } elseif ($supported.Count -eq 1) {
+            $nextStatus = 'Resolved'
+            $nextResolution = $supported[0].Referent
+        } elseif ($supported.Count -gt 1) {
+            $nextStatus = 'Ambiguous'
+        }
+        if (!$nextResolution) { $nextCapability = '' }
+        $keys = [string[]]@($supported | ForEach-Object { $_.ReferentKey })
+        if ($nextStatus -ceq $this.Status -and [object]::ReferenceEquals($nextResolution,$this.Resolution) -and
+            $nextCapability -ceq $this.ResolutionCapability -and $this.History.Count -and
+            [Linq.Enumerable]::SequenceEqual($keys,$this.History[-1].CandidateKeys)) { return }
+        $this.Status = $nextStatus
+        $this.Resolution = $nextResolution
+        $this.ResolutionCapability = $nextCapability
+        $this.Version++
+        $this.History.Add([ProvidenceReverieJudgment]@{
+            Version = $this.Version
+            ObservedAt = [datetime]::UtcNow
+            Status = $nextStatus
+            CandidateKeys = $keys
+            ResolutionCapability = $nextCapability
+        })
+    }
 }
 class ProvidenceCapability {
     [string] $Key
@@ -59,6 +121,7 @@ class ProvidenceCapability {
     [string[]] $Dependencies = @()
     [string] $Kind = 'ReflectedMember'
     [bool] $Valid = $true
+    [bool] $Suspended
     [bool] $ObservedOnRealReferent = $false
     [long] $Applications = 0
     [long] $Successful = 0
@@ -81,6 +144,8 @@ class ProvidenceField {
     [Dictionary[string,ProvidenceReverie]] $Reveries = [Dictionary[string,ProvidenceReverie]]::new([StringComparer]::Ordinal)
     [Dictionary[object,List[ProvidenceReverie]]] $RequirementsByOwner = [Dictionary[object,List[ProvidenceReverie]]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
     [Dictionary[string,ProvidencePercept]] $Percepts = [Dictionary[string,ProvidencePercept]]::new([StringComparer]::Ordinal)
+    [Dictionary[string,List[ProvidencePercept]]] $RelationshipsByOwner = [Dictionary[string,List[ProvidencePercept]]]::new([StringComparer]::Ordinal)
+    [Dictionary[string,List[ProvidencePercept]]] $RelationshipsByReferent = [Dictionary[string,List[ProvidencePercept]]]::new([StringComparer]::Ordinal)
     [Dictionary[string,string]] $FileObservations = [Dictionary[string,string]]::new([StringComparer]::Ordinal)
     [Dictionary[object,string]] $ReferentKeys = [Dictionary[object,string]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
     [Dictionary[object,string]] $Families = [Dictionary[object,string]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
@@ -184,6 +249,7 @@ class ProvidenceField {
             foreach($claim in $claims){
                 if($claim.OwnerKey -ceq $key){$claim.Owner=$referent}
                 if($claim.ReferentKey -ceq $key){$claim.Referent=$referent}
+                if($claim.Owner){$this.ReconsiderOwner($claim.Owner)}
             }
             $null=$this.PendingByKey.Remove($key)
         }
@@ -202,6 +268,43 @@ class ProvidenceField {
         }
         return $true
     }
+    [void] IndexRelationship([ProvidencePercept] $relationship) {
+        $owner = $relationship.OwnerKey
+        if (!$this.RelationshipsByOwner.ContainsKey($owner)) {
+            $this.RelationshipsByOwner.Add($owner,[List[ProvidencePercept]]::new())
+        }
+        $this.RelationshipsByOwner[$owner].Add($relationship)
+        $referent = $relationship.ReferentKey
+        if (!$this.RelationshipsByReferent.ContainsKey($referent)) {
+            $this.RelationshipsByReferent.Add($referent,[List[ProvidencePercept]]::new())
+        }
+        $this.RelationshipsByReferent[$referent].Add($relationship)
+    }
+
+    [ProvidencePercept[]] Alignments([object] $unit) {
+        $key = $this.ObjectKey($unit)
+        $links = [List[ProvidencePercept]]::new()
+        $outgoing = $null
+        if ($this.RelationshipsByOwner.TryGetValue($key,[ref]$outgoing)) {
+            $links.AddRange($outgoing)
+        }
+        $incoming = $null
+        if ($this.RelationshipsByReferent.TryGetValue($key,[ref]$incoming)) {
+            foreach ($link in $incoming) {
+                if ($link.OwnerKey -cne $key) { $links.Add($link) }
+            }
+        }
+        return $links.ToArray()
+    }
+
+    [void] ReconsiderOwner([object] $owner) {
+        $requirements = $null
+        if (!$this.RequirementsByOwner.TryGetValue($owner,[ref]$requirements)) { return }
+        $relationships = $null
+        $null = $this.RelationshipsByOwner.TryGetValue($this.ObjectKey($owner),[ref]$relationships)
+        foreach ($requirement in $requirements) { $requirement.Reconsider($relationships,$this.Capabilities) }
+    }
+
     [void] Schedule([object]$referent,[string]$key) {
         $cap=$null
         if (!$this.Capabilities.TryGetValue($key,[ref]$cap) -or !$cap.Valid) { return }
@@ -211,7 +314,7 @@ class ProvidenceField {
             if (!$this.RequirementsByOwner.TryGetValue($referent,[ref]$requirements)) { return }
             $applicable=$false
             foreach($requirement in $requirements){
-                if($requirement.Status -ceq 'Blocked' -and $requirement.NeededType -and
+                if($requirement.NeededType -and
                     $requirement.NeededType.IsAssignableFrom($cap.OutputType)){
                     $applicable=$true
                     break
@@ -232,7 +335,7 @@ class ProvidenceField {
         }
         # An available typed capability can wake a previously blocked question.
         foreach ($reverie in $this.Reveries.Values) {
-            if ($reverie.Status -cne 'Blocked' -or !$reverie.Owner -or !$reverie.NeededType) { continue }
+            if (!$reverie.Owner -or !$reverie.NeededType) { continue }
             if ($cap.InputType.IsAssignableFrom($reverie.Owner.GetType()) -and
                 $reverie.NeededType.IsAssignableFrom($cap.OutputType)) {
                 $this.Schedule($reverie.Owner,$cap.Key)
@@ -336,21 +439,11 @@ class ProvidenceField {
             }
             $ownerKey=$this.ObjectKey($work.Referent)
             $family=$this.Families[$work.Referent]
-            $requirements=$null
-            $null=$this.RequirementsByOwner.TryGetValue($work.Referent,[ref]$requirements)
             $index=0
             foreach ($result in $nodes) {
                 $id=$ownerKey+'/'+$cap.Key+'['+$index+']'
                 $null=$this.Register($result,$id,$family)
                 $targetKey=$this.ObjectKey($result)
-                foreach($rev in $requirements){
-                    if($rev.Status -cne 'Blocked' -or !$rev.Owner -or !$rev.NeededType){continue}
-                    if([object]::ReferenceEquals($rev.Owner,$work.Referent) -and
-                        $rev.NeededType.IsAssignableFrom($result.GetType())){
-                        $rev.Status='Resolved';$rev.Resolution=$result;$rev.ResolutionCapability=$cap.Key
-                        $rev.Version++
-                    }
-                }
                 $relationKey=$ownerKey+' => '+$targetKey
                 $edgeKey=$relationKey+'/'+$cap.Key
                 if ($this.ObservedPairs.Add($edgeKey)) {
@@ -359,6 +452,7 @@ class ProvidenceField {
                         $p=[ProvidencePercept]::new();$p.Key=$relationKey;$p.Owner=$work.Referent;$p.Referent=$result
                         $p.OwnerKey=$ownerKey;$p.ReferentKey=$targetKey
                         $this.Percepts.Add($relationKey,$p)
+                        $this.IndexRelationship($p)
                     }
                     $prior=$null
                     foreach($candidate in $p.Bearings){
@@ -369,7 +463,7 @@ class ProvidenceField {
                     if($prior){
                         # A persisted bearing is verified again against the real CLR graph.
                         $prior.Owner=$work.Referent;$prior.Referent=$result
-                        $prior.Valid=$cap.Valid;$prior.ObservedAt=[DateTime]::UtcNow
+                        $prior.Valid=$cap.Valid
                         $this.RepeatedObservationsAvoided++
                     } else {
                         $bearing=[ProvidenceBearing]::new();$bearing.Owner=$work.Referent;$bearing.Referent=$result
@@ -383,6 +477,7 @@ class ProvidenceField {
                 }
                 $index++
             }
+            $this.ReconsiderOwner($work.Referent)
         } catch {
             $cap.Failures++;$this.Errors++
             $id=$this.ObjectKey($work.Referent)+'/'+$cap.Key
@@ -411,6 +506,7 @@ class ProvidenceField {
     }
     [void] Withdraw([string]$key) {
         if (!$this.Capabilities.ContainsKey($key)) { throw 'Unknown acquired capability' }
+        $this.Capabilities[$key].Suspended = $true
         $pending=[Queue[string]]::new();$pending.Enqueue($key)
         $visited=[HashSet[string]]::new([StringComparer]::Ordinal)
         while($pending.Count){
@@ -420,26 +516,22 @@ class ProvidenceField {
             foreach($child in $this.Capabilities.Values){ if($item -cin $child.Dependencies){$pending.Enqueue($child.Key)} }
         }
         foreach($p in $this.Percepts.Values){$p.Reconsider($this.Capabilities)}
-        foreach($r in $this.Reveries.Values){
-            if($r.Status -ceq 'Resolved' -and $r.ResolutionCapability -and
-                !$this.Capabilities[$r.ResolutionCapability].Valid){
-                $r.Status='Blocked';$r.Resolution=$null;$r.Version++
-            }
-        }
+        foreach ($owner in $this.RequirementsByOwner.Keys) { $this.ReconsiderOwner($owner) }
     }
     [void] Restore([string]$key) {
         if (!$this.Capabilities.ContainsKey($key)) { throw 'Unknown acquired capability' }
-        $this.Capabilities[$key].Valid=$true
+        $this.Capabilities[$key].Suspended=$false
         $changed=$true
         while($changed){
             $changed=$false
             foreach($cap in $this.Capabilities.Values){
-                if($cap.Valid -or !$cap.Dependencies.Count){continue}
+                if($cap.Valid -or $cap.Suspended){continue}
                 $all=$true;foreach($dependency in $cap.Dependencies){if(!$this.Capabilities[$dependency].Valid){$all=$false;break}}
                 if($all){$cap.Valid=$true;$changed=$true}
             }
         }
         foreach($p in $this.Percepts.Values){$p.Reconsider($this.Capabilities)}
+        foreach ($owner in $this.RequirementsByOwner.Keys) { $this.ReconsiderOwner($owner) }
         foreach($type in $this.ByType.Keys){
             foreach($obj in $this.ByType[$type]){
                 foreach($cap in $this.Capabilities.Values){if($cap.Valid -and $cap.InputType.IsAssignableFrom($type)){$this.Schedule($obj,$cap.Key)}}
@@ -462,6 +554,7 @@ class ProvidenceField {
             $this.RequirementsByOwner.Add($owner,[List[ProvidenceReverie]]::new())
         }
         $this.RequirementsByOwner[$owner].Add($r)
+        $this.ReconsiderOwner($owner)
         foreach($c in $this.Capabilities.Values){
             if($c.Valid -and $c.InputType.IsAssignableFrom($owner.GetType()) -and
                 $neededType.IsAssignableFrom($c.OutputType)){$this.Schedule($owner,$c.Key)}
@@ -504,7 +597,7 @@ function Save-ProvidenceField {
     $tmp=$full+'.'+[guid]::NewGuid().ToString('N')+'.partial'
     $writer=[IO.BinaryWriter]::new([IO.File]::Open($tmp,[IO.FileMode]::CreateNew))
     try {
-        $writer.Write('Providence-StructuralField/2')
+        $writer.Write('Providence-StructuralField/3')
         $writer.Write($Field.FileObservations.Count)
         foreach($entry in $Field.FileObservations.GetEnumerator()){$writer.Write($entry.Key);$writer.Write($entry.Value)}
         $writer.Write($Field.Capabilities.Count)
@@ -514,7 +607,7 @@ function Save-ProvidenceField {
             $writer.Write($cap.OutputType.FullName)
             $writer.Write($cap.Path.Length)
             foreach($member in $cap.Path){$writer.Write($member.DeclaringType.FullName);$writer.Write($member.Name)}
-            $writer.Write($cap.Valid);$writer.Write($cap.ObservedOnRealReferent)
+            $writer.Write($cap.Valid);$writer.Write($cap.ObservedOnRealReferent);$writer.Write($cap.Suspended)
             $writer.Write($cap.Applications);$writer.Write($cap.Successful);$writer.Write($cap.Failures);$writer.Write($cap.ElapsedTicks)
             $writer.Write($cap.Dependencies.Length)
             foreach($depend in $cap.Dependencies){$writer.Write($depend)}
@@ -524,7 +617,10 @@ function Save-ProvidenceField {
             $writer.Write($p.OwnerKey);$writer.Write($p.ReferentKey);$writer.Write($p.Reliance)
             $writer.Write($p.Acquired);$writer.Write($p.Version);$writer.Write($p.Scope)
             $writer.Write($p.Bearings.Count)
-            foreach($b in $p.Bearings){$writer.Write($b.CapabilityKey);$writer.Write($b.SourceFamily);$writer.Write($b.Valid)}
+            foreach($b in $p.Bearings){
+                $writer.Write($b.CapabilityKey);$writer.Write($b.SourceFamily);$writer.Write($b.Valid)
+                $writer.Write($b.ObservedAt.ToBinary())
+            }
         }
         $writer.Write($Field.Reveries.Count)
         foreach($r in $Field.Reveries.Values){
@@ -532,6 +628,13 @@ function Save-ProvidenceField {
             $writer.Write($r.Reason);$writer.Write($r.Status);$writer.Write($r.Version)
             $writer.Write([string]$r.ResolutionCapability)
             $writer.Write($(if($r.NeededType){$r.NeededType.FullName}else{''}))
+            $writer.Write($r.History.Count)
+            foreach ($judgment in $r.History) {
+                $writer.Write($judgment.Version);$writer.Write($judgment.ObservedAt.ToBinary())
+                $writer.Write($judgment.Status);$writer.Write($judgment.ResolutionCapability)
+                $writer.Write($judgment.CandidateKeys.Length)
+                foreach ($key in $judgment.CandidateKeys) { $writer.Write($key) }
+            }
         }
         $pending=[List[object[]]]::new()
         foreach($job in $Field.Investigations){
@@ -554,7 +657,8 @@ function Import-ProvidenceField {
     $field=[ProvidenceField]::new()
     $reader=[IO.BinaryReader]::new([IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).Path))
     try {
-        if($reader.ReadString() -cne 'Providence-StructuralField/2'){
+        $schema = $reader.ReadString()
+        if($schema -cnotin 'Providence-StructuralField/2','Providence-StructuralField/3'){
             throw 'Unsupported field version; do not silently flatten or discard prior evidence'
         }
         $files=$reader.ReadInt32()
@@ -573,6 +677,8 @@ function Import-ProvidenceField {
             }
             $c.Path=$members.ToArray();$c.Depth=$c.Path.Count
             $c.Valid=$reader.ReadBoolean();$c.ObservedOnRealReferent=$reader.ReadBoolean()
+            if ($schema -ceq 'Providence-StructuralField/3') { $c.Suspended=$reader.ReadBoolean() }
+            else { $c.Suspended = !$c.Valid }
             $c.Applications=$reader.ReadInt64();$c.Successful=$reader.ReadInt64()
             $c.Failures=$reader.ReadInt64();$c.ElapsedTicks=$reader.ReadInt64()
             $deps=$reader.ReadInt32();$c.Dependencies=[string[]]@(for($j=0;$j -lt $deps;$j++){$reader.ReadString()})
@@ -595,9 +701,11 @@ function Import-ProvidenceField {
             for($j=0;$j -lt $evidence;$j++){
                 $b=[ProvidenceBearing]::new();$b.OwnerKey=$p.OwnerKey;$b.ReferentKey=$p.ReferentKey
                 $b.CapabilityKey=$reader.ReadString();$b.SourceFamily=$reader.ReadString();$b.Valid=$reader.ReadBoolean()
+                if ($schema -ceq 'Providence-StructuralField/3') { $b.ObservedAt=[datetime]::FromBinary($reader.ReadInt64()) }
                 $p.Bearings.Add($b)
             }
             $field.Percepts[$p.Key]=$p
+            $field.IndexRelationship($p)
             foreach($key in @($p.OwnerKey,$p.ReferentKey)){
                 if(!$field.PendingByKey.ContainsKey($key)){$field.PendingByKey[$key]=[List[ProvidencePercept]]::new()}
                 $field.PendingByKey[$key].Add($p)
@@ -611,6 +719,19 @@ function Import-ProvidenceField {
             $r.ResolutionCapability=$reader.ReadString()
             $typeName=$reader.ReadString()
             if($typeName){$r.NeededType=Resolve-ProvidenceType $typeName}
+            if ($schema -ceq 'Providence-StructuralField/3') {
+                $count = $reader.ReadInt32()
+                for ($j=0;$j -lt $count;$j++) {
+                    $judgment = [ProvidenceReverieJudgment]::new()
+                    $judgment.Version=$reader.ReadInt64()
+                    $judgment.ObservedAt=[datetime]::FromBinary($reader.ReadInt64())
+                    $judgment.Status=$reader.ReadString()
+                    $judgment.ResolutionCapability=$reader.ReadString()
+                    $length=$reader.ReadInt32()
+                    $judgment.CandidateKeys=[string[]]@(for ($k=0;$k -lt $length;$k++) { $reader.ReadString() })
+                    $r.History.Add($judgment)
+                }
+            }
             $field.Reveries[$r.Key]=$r
         }
         $jobs=$reader.ReadInt32()
