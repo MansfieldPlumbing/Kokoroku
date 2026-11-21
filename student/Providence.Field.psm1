@@ -39,12 +39,20 @@ class ProvidencePercept {
         if ($this.Reliance -cne $next) { $this.Reliance=$next; $this.Version++ }
     }
 }
+class ProvidenceDistinction {
+    [string] $DeclaringType
+    [string] $MemberName
+    [int[]] $Partition
+    [int] $DistinctValues
+    [bool] $ReferenceIdentity
+}
 class ProvidenceReverieJudgment {
     [long] $Version
     [datetime] $ObservedAt
     [string] $Status
     [string[]] $CandidateKeys
     [string] $ResolutionCapability
+    [ProvidenceDistinction[]] $Distinctions = @()
 }
 class ProvidenceReverie {
     [string] $Key
@@ -59,6 +67,61 @@ class ProvidenceReverie {
     [long] $Version = 0
     [ProvidencePercept[]] $Alternatives = @()
     [List[ProvidenceReverieJudgment]] $History = [List[ProvidenceReverieJudgment]]::new()
+
+    hidden static [ProvidenceDistinction[]] CompareAlternatives([object[]] $alternatives,[string] $prefix,[int] $remainingDepth) {
+        $surface = $alternatives[0].GetType()
+        $distinctions = [List[ProvidenceDistinction]]::new()
+        foreach ($member in $surface.GetProperties([BindingFlags]'Public,Instance')) {
+            if (!$member.CanRead -or $member.GetIndexParameters().Length -or
+                !$member.DeclaringType.Assembly.IsDynamic) { continue }
+            # SMA class properties are observed CLR slots. Skip collection slots:
+            # two separately allocated vectors need not encode different evidence.
+            $type = $member.PropertyType
+            if ($type -ne [string] -and [System.Collections.IEnumerable].IsAssignableFrom($type)) { continue }
+            $partition = [int[]]::new($alternatives.Count)
+            $references = $type -ne [string] -and !$type.IsValueType
+            $reached = [object[]]::new($alternatives.Count)
+            $values = if ($references) { [Dictionary[object,int]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance) }
+                else { [Dictionary[object,int]]::new() }
+            $complete = $true
+            for ($i = 0; $i -lt $alternatives.Count; $i++) {
+                $referent = $alternatives[$i]
+                if (!$member.DeclaringType.IsInstanceOfType($referent)) {
+                    $complete = $false
+                    break
+                }
+                $value = $member.GetValue($referent)
+                if ($null -eq $value -or ($references -and ($value -is [string] -or $value -is [ValueType] -or
+                    $value -is [System.Collections.IEnumerable]))) {
+                    $complete = $false
+                    break
+                }
+                [int]$slot = 0
+                if (!$values.TryGetValue($value,[ref]$slot)) {
+                    $slot = $values.Count
+                    $values.Add($value,$slot)
+                }
+                $partition[$i] = $slot
+                $reached[$i] = $value
+            }
+            if ($complete) {
+                $path = $prefix+$member.Name
+                $distinctions.Add([ProvidenceDistinction]@{
+                    DeclaringType = $member.DeclaringType.FullName
+                    MemberName = $path
+                    Partition = $partition
+                    DistinctValues = $values.Count
+                    ReferenceIdentity = $references
+                })
+                # Continue only where the competing observations actually lead
+                # to different objects. A shared link cannot explain their split.
+                if ($references -and $values.Count -gt 1 -and $remainingDepth -gt 1) {
+                    $distinctions.AddRange([ProvidenceReverie]::CompareAlternatives($reached,$path+'.',$remainingDepth-1))
+                }
+            }
+        }
+        return $distinctions.ToArray()
+    }
 
     [void] Reconsider([List[ProvidencePercept]] $relationships, [Dictionary[string,ProvidenceCapability]] $capabilities) {
         $candidates = [List[ProvidencePercept]]::new()
@@ -104,13 +167,29 @@ class ProvidenceReverie {
         $this.Resolution = $nextResolution
         $this.ResolutionCapability = $nextCapability
         $this.Version++
-        $this.History.Add([ProvidenceReverieJudgment]@{
+        $judgment = [ProvidenceReverieJudgment]@{
             Version = $this.Version
             ObservedAt = [datetime]::UtcNow
             Status = $nextStatus
             CandidateKeys = $keys
             ResolutionCapability = $nextCapability
-        })
+        }
+        if ($nextStatus -ceq 'Ambiguous') {
+            # As in collision-driven refinement, actual competing observations
+            # expose which existing distinctions could matter. This is evidence
+            # for another investigation, not a selection of the correct referent.
+            foreach ($prior in $this.History) {
+                if ($prior.Distinctions.Length -and [Linq.Enumerable]::SequenceEqual($keys,$prior.CandidateKeys)) {
+                    $judgment.Distinctions = $prior.Distinctions
+                    break
+                }
+            }
+            if (!$judgment.Distinctions.Length) {
+                $referents = [object[]]@($supported | ForEach-Object { $_.Referent })
+                $judgment.Distinctions = [ProvidenceReverie]::CompareAlternatives($referents,'',2)
+            }
+        }
+        $this.History.Add($judgment)
     }
 }
 class ProvidenceCapability {
@@ -749,7 +828,7 @@ function Save-ProvidenceField {
     $tmp=$full+'.'+[guid]::NewGuid().ToString('N')+'.partial'
     $writer=[IO.BinaryWriter]::new([IO.File]::Open($tmp,[IO.FileMode]::CreateNew))
     try {
-        $writer.Write('Providence-StructuralField/4')
+        $writer.Write('Providence-StructuralField/5')
         $writer.Write($Field.FileObservations.Count)
         foreach($entry in $Field.FileObservations.GetEnumerator()){$writer.Write($entry.Key);$writer.Write($entry.Value)}
         $writer.Write($Field.Capabilities.Count)
@@ -787,6 +866,12 @@ function Save-ProvidenceField {
                 $writer.Write($judgment.Status);$writer.Write($judgment.ResolutionCapability)
                 $writer.Write($judgment.CandidateKeys.Length)
                 foreach ($key in $judgment.CandidateKeys) { $writer.Write($key) }
+                $writer.Write($judgment.Distinctions.Length)
+                foreach ($distinction in $judgment.Distinctions) {
+                    $writer.Write($distinction.DeclaringType);$writer.Write($distinction.MemberName)
+                    $writer.Write($distinction.DistinctValues);$writer.Write($distinction.ReferenceIdentity)
+                    foreach ($slot in $distinction.Partition) { $writer.Write($slot) }
+                }
             }
         }
         $pending=[List[object[]]]::new()
@@ -811,7 +896,7 @@ function Import-ProvidenceField {
     $reader=[IO.BinaryReader]::new([IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).Path))
     try {
         $schema = $reader.ReadString()
-        if($schema -cnotin 'Providence-StructuralField/2','Providence-StructuralField/3','Providence-StructuralField/4'){
+        if($schema -cnotin 'Providence-StructuralField/2','Providence-StructuralField/3','Providence-StructuralField/4','Providence-StructuralField/5'){
             throw 'Unsupported field version; do not silently flatten or discard prior evidence'
         }
         $files=$reader.ReadInt32()
@@ -832,7 +917,7 @@ function Import-ProvidenceField {
             $c.Valid=$reader.ReadBoolean();$c.ObservedOnRealReferent=$reader.ReadBoolean()
             if ($schema -cne 'Providence-StructuralField/2') { $c.Suspended=$reader.ReadBoolean() }
             else { $c.Suspended = !$c.Valid }
-            if ($schema -ceq 'Providence-StructuralField/4') { $c.Kind=$reader.ReadString() }
+            if ($schema -cin 'Providence-StructuralField/4','Providence-StructuralField/5') { $c.Kind=$reader.ReadString() }
             $c.Applications=$reader.ReadInt64();$c.Successful=$reader.ReadInt64()
             $c.Failures=$reader.ReadInt64();$c.ElapsedTicks=$reader.ReadInt64()
             $deps=$reader.ReadInt32();$c.Dependencies=[string[]]@(for($j=0;$j -lt $deps;$j++){$reader.ReadString()})
@@ -883,6 +968,18 @@ function Import-ProvidenceField {
                     $judgment.ResolutionCapability=$reader.ReadString()
                     $length=$reader.ReadInt32()
                     $judgment.CandidateKeys=[string[]]@(for ($k=0;$k -lt $length;$k++) { $reader.ReadString() })
+                    if ($schema -ceq 'Providence-StructuralField/5') {
+                        $numberOfDistinctions = $reader.ReadInt32()
+                        $judgment.Distinctions = [ProvidenceDistinction[]]@(for ($k=0;$k -lt $numberOfDistinctions;$k++) {
+                            $distinction = [ProvidenceDistinction]::new()
+                            $distinction.DeclaringType = $reader.ReadString()
+                            $distinction.MemberName = $reader.ReadString()
+                            $distinction.DistinctValues = $reader.ReadInt32()
+                            $distinction.ReferenceIdentity = $reader.ReadBoolean()
+                            $distinction.Partition = [int[]]@(for ($slot=0;$slot -lt $length;$slot++) { $reader.ReadInt32() })
+                            $distinction
+                        })
+                    }
                     $r.History.Add($judgment)
                 }
             }
