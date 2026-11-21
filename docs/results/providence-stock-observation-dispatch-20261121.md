@@ -13,3 +13,9 @@ $archive = ($result | ConvertFrom-Json).Archive
 ```
 
 The published methods and the request's intended return type are existing authored contracts. The result verifies typed dispatch, reversible dependency and fresh reconstruction. It does not establish a new speech relationship. The NL1 reconstruction covers the retained stock normalization judgment with a verified stock clock and captured frame counts. Compositional type refinements requiring multiple arguments, correspondence across independent performances, and criterion-driven admission of learned operations remain open.
+
+## Reuse in a second investigation
+
+The clock supplier now records its result as a typed alignment owned by the stock execution. The first scope, decoder.module.encode.norm1, takes two method calls. Asking for the execution's clock then resolves against that alignment. Asking about decoder.module.encode.norm2 takes one additional method call and uses the same clock object. Previously the field called both methods per scope, for four calls across these two questions. Three calls also match a direct implementation that holds the clock in a local variable. This is an invocation count, with no claim about elapsed time.
+
+The archive and NL1 contain the first observation only. A fresh process restores it with zero observation method calls, then evaluates the second scope with one call. Both scopes agree with the retained clock. Withdrawing the supplier blocks the clock request and the dependent scope judgment. Readmission restores the same observations without invoking either method again. This demonstrates reuse within one execution family. The second question and both observation methods were supplied by the test.

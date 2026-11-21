@@ -25,10 +25,43 @@ $executions = @(foreach ($index in Get-ChildItem (Join-Path $BankPath 'paired-te
     (Open-StudentTeacherObservation $index.DirectoryName $document).StockExecution
 })
 $execution,$other = $executions
-$scope = $execution.Normalizations | Where-Object TokenFrames | Select-Object -First 1
-if (!$scope -or !$other) { throw 'Retained run requires decoder token accumulators and a competing execution.' }
+$scope,$nextScope = $execution.Normalizations | Where-Object TokenFrames | Select-Object -First 2
+if (!$scope -or !$nextScope -or !$other) { throw 'Retained run requires two decoder scopes and a competing execution.' }
 $reason = 'Investigate whether captured normalization scope agrees with the execution token clock'
 $family = $execution.Teacher.Document.Source.EvidenceGroup
+
+function Test-DependentScope {
+    [OutputType([int])]
+    param([ProvidenceField] $Field,[StudentNormalizationClockBearing] $First)
+
+    $startCalls = $Field.ActualCalls
+    $clockRequest = $Field.Require($execution,[StudentExecutionClockBearing],'Find the token clock of the stock execution')
+    if (![object]::ReferenceEquals($clockRequest.Resolution,$First.TokenClock)) {
+        throw 'The clock supplier did not publish an independently addressable observation.'
+    }
+    $null = $Field.Register($nextScope,'',$family)
+    $nextRequest = $Field.Require($nextScope,[StudentNormalizationClockBearing],$reason)
+    if ($Field.Investigations.Count -ne 1) { throw 'Only the second scope should need an invocation.' }
+    $nextWork = $Field.Investigations.Peek()
+    $Field.PreferFocused = $true
+    $null = $Field.Advance(1)
+    $next = $nextRequest.Resolution
+    if (!$next -or $next.Status -ne [StudentExecutionClockStatus]::Agreement -or
+        ![object]::ReferenceEquals($next.TokenClock,$First.TokenClock) -or $Field.ActualCalls -ne $startCalls + 1) {
+        throw 'The second scope did not reuse the observed clock.'
+    }
+    $supplierKey = $Field.Capabilities[$nextWork.CapabilityKey].Dependencies[0]
+    $Field.Withdraw($supplierKey)
+    if ($clockRequest.Status -cne 'Blocked' -or $nextRequest.Status -cne 'Blocked') {
+        throw 'Supplier withdrawal did not invalidate both judgments.'
+    }
+    $Field.Restore($supplierKey)
+    if (![object]::ReferenceEquals($nextRequest.Resolution,$next) -or $Field.ActualCalls -ne $startCalls + 1) {
+        throw 'Restoring the supplier did not reuse the existing scope observation.'
+    }
+    return [int]($Field.ActualCalls - $startCalls)
+}
+
 if ($ReplayArchive) {
     $restored = Import-ProvidenceField -Path $ReplayArchive
     $result = Read-StudentStockScopeRecord -Line ([IO.File]::ReadAllText("$ReplayArchive.nl1")) -Execution $execution
@@ -45,11 +78,15 @@ if ($ReplayArchive) {
         ![object]::ReferenceEquals($result.Scope,$scope) -or
         ![object]::ReferenceEquals($result.TokenClock.Execution,$execution) -or
         $restored.Investigations.Count -or $restored.ActualCalls) { throw 'Fresh reconstruction required rediscovery.' }
+    $reloadCalls = $restored.ActualCalls
+    $nextCalls = Test-DependentScope -Field $restored -First $result
     [ordered]@{
         Site = $result.Scope.Site
         Status = $result.Status.ToString()
         Tokens = $result.CapturedFrames.Length
-        ReloadDispatches = $restored.ActualCalls
+        ReloadDispatches = $reloadCalls
+        NextSite = $nextScope.Site
+        NextSiteDispatches = $nextCalls
         ForeignExecutionRejected = $foreignRejected
     } | ConvertTo-Json
     return
@@ -65,9 +102,10 @@ if ($question.Status -cne 'Blocked') { throw 'The question must start blocked.' 
 foreach ($method in Get-StudentStockObservationMethod) { $field.PublishObservation($method) }
 $operation = @($field.Capabilities.Values | Where-Object InputType -EQ ([StudentStockNormalization]))
 if ($operation.Count -ne 1) { throw 'Expected one applicable typed observation.' }
-$item = $field.Investigations.Dequeue()
+$item = $field.Investigations.Peek()
 if ($item.CapabilityKey -cne $operation[0].Key) { throw 'Typed operation was not nominated by the requirement.' }
-$field.Execute($item)
+$field.PreferFocused = $true
+$null = $field.Advance(1)
 $result = $question.Resolution
 if (!$result -or $result.Status -ne [StudentExecutionClockStatus]::Agreement -or
     ![object]::ReferenceEquals($result.Scope,$scope) -or
@@ -96,6 +134,8 @@ foreach ($method in Get-StudentStockObservationMethod) { $restored.PublishObserv
 $reopened = $restored.Require($scope,[StudentNormalizationClockBearing],$reason)
 if (![object]::ReferenceEquals($reopened.Resolution,$result) -or
     $restored.Investigations.Count -or $restored.ActualCalls) { throw 'Saved interpretation required rediscovery.' }
+$firstCalls = $field.ActualCalls
+$nextCalls = Test-DependentScope -Field $field -First $result
 
 [ordered]@{
     Source = $execution.Teacher.Document.Source.Id
@@ -106,7 +146,9 @@ if (![object]::ReferenceEquals($reopened.Resolution,$result) -or
     Status = $result.Status.ToString()
     Tokens = $result.CapturedFrames.Length
     ScopeFrames = $scope.ScopeFrameCount()
-    Dispatches = $field.ActualCalls
+    Dispatches = $firstCalls
+    NextSite = $nextScope.Site
+    NextSiteDispatches = $nextCalls
     ReloadDispatches = $restored.ActualCalls
     Archive = $archive
 } | ConvertTo-Json

@@ -324,6 +324,22 @@ class ProvidenceField {
         foreach ($requirement in $requirements) { $requirement.Reconsider($relationships,$this.Capabilities) }
     }
 
+    [ProvidencePercept[]] ObservationsBy([object] $owner,[string] $operation) {
+        $relationships = $null
+        if (!$this.RelationshipsByOwner.TryGetValue($this.ObjectKey($owner),[ref]$relationships)) { return @() }
+        $results = [List[ProvidencePercept]]::new()
+        foreach ($relationship in $relationships) {
+            if (!$relationship.Referent) { continue }
+            foreach ($bearing in $relationship.Bearings) {
+                if ($bearing.CapabilityKey -ceq $operation) {
+                    $results.Add($relationship)
+                    break
+                }
+            }
+        }
+        return $results.ToArray()
+    }
+
     [void] Schedule([object]$referent,[string]$key) {
         $cap=$null
         if (!$this.Capabilities.TryGetValue($key,[ref]$cap) -or !$cap.Valid) { return }
@@ -331,12 +347,7 @@ class ProvidenceField {
         if ($cap.Kind -ceq 'ObservationMethod') {
             $bindings = $null
             if (!$cap.Method -or !$this.ObservationBindings.TryGetValue($referent,[ref]$bindings) -or !$bindings.Contains($key)) { return }
-            $relationships = $null
-            if ($this.RelationshipsByOwner.TryGetValue($this.ObjectKey($referent),[ref]$relationships)) {
-                foreach ($relationship in $relationships) {
-                    if ($relationship.Referent -and $key -cin $relationship.Bearings.CapabilityKey) { return }
-                }
-            }
+            if ($this.ObservationsBy($referent,$key).Count) { return }
         }
         if ($cap.Method -or $cap.Kind -ceq 'ObservationMethod' -or $cap.Depth -gt 1) {
             $requirements=$null
@@ -520,6 +531,7 @@ class ProvidenceField {
         $cap=$null
         if (!$this.Capabilities.TryGetValue($work.CapabilityKey,[ref]$cap) -or !$cap.Valid) { return }
         if ($cap.Kind -ceq 'ObservationMethod' -and !$cap.Method) { return }
+        if ($cap.Method -and $this.ObservationsBy($work.Referent,$cap.Key).Count) { return }
         $watch=[Diagnostics.Stopwatch]::StartNew()
         try {
             $nodes=[object[]]@($work.Referent)
@@ -529,13 +541,15 @@ class ProvidenceField {
                     $argumentOwner = $cap.Path[0].GetValue($work.Referent)
                     if (!$argumentOwner) { return }
                     $null = $this.Register($argumentOwner,$this.ObjectKey($work.Referent)+'/argument-owner',$this.Families[$work.Referent])
-                    $this.ActualCalls++
-                    $argument = $cap.ArgumentMethod.Invoke($argumentOwner,$null)
-                    if (!$argument) { return }
-                    $argumentKey = $this.QualifiedKey($argument,$this.ObjectKey($work.Referent)+'/argument')
-                    if ($this.ByKey.ContainsKey($argumentKey)) { $argument = $this.ByKey[$argumentKey] }
-                    else { $null = $this.Register($argument,$argumentKey,$this.Families[$work.Referent]) }
-                    $arguments = [object[]]@($argument)
+                    $supplier = $cap.Dependencies[0]
+                    $supplied = $this.ObservationsBy($argumentOwner,$supplier)
+                    if (!$supplied.Count) {
+                        $this.Execute([ProvidenceWork]::Create($argumentOwner,$supplier))
+                        $supplied = $this.ObservationsBy($argumentOwner,$supplier)
+                    }
+                    $parameter = $cap.Method.GetParameters()[0]
+                    if ($supplied.Count -ne 1 -or !$parameter.ParameterType.IsInstanceOfType($supplied[0].Referent)) { return }
+                    $arguments = [object[]]@($supplied[0].Referent)
                 }
                 $result = $cap.Method.Invoke($work.Referent,$arguments)
                 $nodes = if ($result) { @($result) } else { @() }
