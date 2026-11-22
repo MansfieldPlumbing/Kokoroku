@@ -1,52 +1,71 @@
-# Paired-teacher utterance audit, 22 November 2022
+# Paired-teacher utterance audit, 22 November 2026
 
-This pass audited the retained paired-teachers source bank with particular attention to teacher utterance `032B5B23`, tick proximity to 942 ticks, the `AE6FD9EE` Kokoro audio, Gutenberg sentence coverage and the Alice Cat utterance directory. The investigation ran across two agent sessions; the first session terminated on individual quota exhaustion before its final check on `AE6FD9EE` could be confirmed.
+This pass audited the retained paired-teachers source bank with particular attention to teacher utterance `032B5B23`, generator tick length relationships, the `AE6FD9EE` Kokoro audio, and the complete 60-record source-bank scan.
 
-## Paired-teachers bank observations
+## Clock and generator tick conversion
 
-The bank at `data/source-bank/paired-teachers/` holds 58 entries identified by SHA-256 directory names. Each entry contains a `kokoro.wav` file at 24 kHz mono 16-bit. A full directory listing confirmed the presence of `032B5B238E955454FDB0095226FF87F346396FB2EB4095ACBF204D978995CB2` and `AE6FD9EE450CD7FED096F3DD719A210628F909A4E17FBA1610E6DEFF45319319` among the 58 retained entries.
+The Kokoro generator in this repository operates on an 80 Hz frame clock (80 ticks per second) against a 24,000 Hz audio sample rate. The relationship between generator ticks and PCM audio samples is exact:
 
-Teacher utterance `032B5B23` was the primary investigation target. Its directory was inspected for paired content, metadata and tick alignment. The search for a 942-tick match and for any 282,600-sample WAV in the broader source bank was part of this investigation.
+$$\text{Samples} = \text{Ticks} \times \frac{24000\text{ samples/sec}}{80\text{ ticks/sec}} = \text{Ticks} \times 300\text{ samples/tick}$$
 
-The six paired-teacher tick counts were obtained from their procedural-execution records. A ranking by closeness to 942 ticks was produced. No exact 942-tick match was found among the six primary paired teachers examined; `032B5B23` did not carry a 282,600-sample audio file.
+- **942 generator ticks** = $942 \times 300 = 282,600$ audio samples (11.775 seconds at 24 kHz).
+- This exactly matches the reference fixture `tools/fixtures/lighthouse-af_heart-float.wav` (282,600 samples, float32, 24 kHz mono) and `build/lighthouse-f0.bin` (942 float32 F0 elements).
+- An earlier draft of this report mistakenly referenced a 44.1 kHz clock resulting in a 512 ms / 12,303-sample estimate; that arithmetic was incorrect and is superseded by this document.
 
-## AE6FD9EE fresh audio check
+## Full paired-teachers bank scan (Measure-PairedTeacherTicks.ps1)
 
-The quota interruption left the sample-count result for `AE6FD9EE` unconfirmed in the first session. A fresh read of the WAV header in the second session resolved the question.
+Using the binary reader against the native `StudentTeacherObservation/1` format and verifying against each `kokoro.wav` header across `data/source-bank/paired-teachers`:
 
-| Property | Value |
-| --- | --- |
-| File | `data/source-bank/paired-teachers/AE6FD9EE…/kokoro.wav` |
-| File size | 258,044 bytes |
-| Channels | 1 (mono) |
-| Sample rate | 24,000 Hz |
-| Bits per sample | 16 |
-| Data chunk size | 258,000 bytes |
-| Total samples | 129,000 |
-| Duration | 5.375 seconds |
-| Equivalent ticks at 44,100 Hz | 237,038 |
+- **Total directories inspected**: 60
+- **Verified WAV headers**: 60
+- **Exact 942-tick (282,600-sample) matches in paired-teachers**: 0
+- **Non-integral tick records**: 0 (all 60 records align to integer 300-sample generator frames)
 
-This file is not a 282,600-sample entry and does not correspond to the 942-tick target. At 24 kHz, a 942-tick passage (at 44,100 Hz clock) would span approximately 512 ms and 12,303 samples—substantially shorter than the 5.375-second `AE6FD9EE` recording. The audio was verified to play correctly. The recording quality was confirmed satisfactory.
+### Nearest records to 942 ticks (282,600 samples)
 
-## Gutenberg sentence investigation
+| Id (Prefix) | Source ID | Sentence Index | Samples | Generator Ticks | Tick Delta | Execution Records |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `D4D2D716` | Gutenberg/30036 | 16 | 260,400 | 868.0 | -74 | Stock |
+| `8D0A260E` | Gutenberg/30036 | 20 | 258,600 | 862.0 | -80 | None |
+| `FFACC1ED` | Gutenberg/11 | 11 | 313,200 | 1,044.0 | +102 | None |
+| `B124B778` | Gutenberg/30036 | 14 | 243,600 | 812.0 | -130 | Stock |
+| `DD12BA97` | Gutenberg/11 | 12 | 231,000 | 770.0 | -172 | Stock |
+| `5EA3C2FA` | Gutenberg/30036 | 0 | 213,000 | 710.0 | -232 | Stock |
+| `AD1D309B` | Gutenberg/11 | — | 361,200 | 1,204.0 | +262 | None |
+| `5E92F252` | Gutenberg/11 | — | 202,800 | 676.0 | -266 | None |
 
-The investigation surveyed Gutenberg eBook entries present in the source bank, including subdirectory `11` (Alice's Adventures in Wonderland) and `30036`. Sentence text at Index 20 was inspected within the `30036` comparisons. The `Open-StudentSpeechInvestigation.ps1` handling of `SourceIdentity` for `Gutenberg/11` entries was examined. Linguistic `pg*.bin` files were listed.
+### AE6FD9EE and 032B5B23 measurements
 
-eBook 11 anchors the existing paired-teacher corpus and the LibriVox dramatic reading. eBook 30036 provides an additional language reference. The investigation's Gutenberg work builds on the four-work foundation already described in the source-breadth result (`student-source-breadth-20261120.md`): eBooks 11, 11615, 14006 and 30036.
+- **`AE6FD9EE`** (Gutenberg/11 sentence 638):
+  - Samples: 129,000 (5.375 s)
+  - Generator ticks: 430.0
+  - Tick delta from 942: **-512 ticks** (-153,600 samples)
+  - Has Stock Execution: True; Has Procedural Execution: True (one of 6 retained procedural records)
+- **`032B5B23`** (Gutenberg/30036 sentence 11):
+  - Samples: 34,800 (1.45 s)
+  - Generator ticks: 116.0
+  - Tick delta from 942: **-826 ticks** (-247,800 samples)
+  - Has Stock Execution: True; Has Procedural Execution: False
 
-## Alice Cat utterance directory
+## Procedural execution records
 
-The Cat utterance directory under the Alice source bank was located and inspected. The Cat utterance generator features were loaded and examined across two attempts in the first session, both of which were interrupted before a confirmed output. The retained profile directory and its `speech-pack.json` were also read. The Alice 12249 `kokoro.wav` tick count was checked against the known paired entry at `teachers-alice-12249` and `teachers-alice-with-events`.
+Only 6 of the 60 entries retain procedural execution histories (`procedural-execution.bin`):
 
-The `teachers-alice-with-events` entry at UTF-16 position 12,249 of Gutenberg eBook 11 is the verified anchor pair. Zira produced native 16 kHz WAV with word and phone events; Kokoro `af_heart` produced 24 kHz WAV with 59 token durations and 284 predictor ticks. The Cat utterance investigation sought additional generator-feature structure specific to that passage.
+| Id (Prefix) | Sentence Index | Samples | Generator Ticks | Tick Delta vs 942 |
+| :--- | :--- | :--- | :--- | :--- |
+| `AE6FD9EE` | 638 | 129,000 | 430.0 | -512 |
+| `0ED832E8` | 8 | 97,800 | 326.0 | -616 |
+| `1CD6CB26` | 403 | 97,200 | 324.0 | -618 |
+| `13665A25` | 24 | 68,400 | 228.0 | -714 |
+| `1BF76143` | 4 | 43,800 | 146.0 | -796 |
+| `18A3FE3C` | 2 | 38,400 | 128.0 | -814 |
 
-## Repository housekeeping
+None of the procedural entries in `paired-teachers` correspond to the 942-tick passage.
 
-The working directory contained an untracked `scratch/` folder not suitable for version control. The entry `/scratch/` was appended to `.gitignore` alongside the existing ignored paths (`/build/`, `*.wav`, `/data/`, etc.). The updated `.gitignore` was committed as `eb0ed49` ("Ignore scratch directory") and pushed to `origin/main`.
+## Diagnostic implications for audio corruption
 
-## Open items
+The 942-tick, 282,600-sample utterance is specifically the **Lighthouse** passage (`tools/fixtures/lighthouse-af_heart-float.wav`), which is supported by:
+- `build/lighthouse-f0.bin` (942 elements)
+- `build/lighthouse-input.bin` (388,032 float elements = 942 frames $\times$ 412 or 512-channel aligned representation)
 
-- No exact 942-tick or 282,600-sample match was confirmed among the 58 paired-teacher entries examined; a full scan ranking all entries by tick distance to 942 was initiated but not completed before quota exhaustion.
-- The Cat utterance generator-feature load did not produce a confirmed result in this session. The retained investigation surface holds the Cat utterance directory reference for a subsequent pass.
-- Syllable stress, phone-level alignment and autonomous acquisition of investigative instruments remain open from earlier sessions.
-- The `AE6FD9EE` audio plays correctly and its properties are now recorded above. Its relationship to the 942-tick investigation is ruled out by sample count.
+The paired-teacher bank contains Gutenberg eBook material (Alice in Wonderland `Gutenberg/11` and English Grammar `Gutenberg/30036`). Searching `paired-teachers` for 942 ticks confirmed zero matches. For diagnosing corrupted phone/audio output on the lighthouse passage, comparing directly against the reference lighthouse croutons (`build/procedural-croutons.bin`) and true pitch/F0 trajectories (`build/lighthouse-true-f0.bin`) is the authoritative diagnostic path.
