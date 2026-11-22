@@ -78,6 +78,8 @@ try {
     $serve = $kv.ContainsKey('Serve')
     # Speech=True: text to WAV in this runspace (the speech mode below) with this job's generator library.
     $speech = $kv.ContainsKey('Speech')
+    # Procedural=True: direct procedural crouton synthesis (zero ALBERT, zero Decoder calls)
+    $procedural = $kv.ContainsKey('Procedural')
     if (-not $serve -and ($tiles -lt 1 -or $tiles -gt 32768 -or $runs -lt 1 -or $runs -gt 121 -or $samples -lt 1 -or $pcmOffset + 2 * $samples -gt $outputBytes)) { throw 'Spec out of range' }
     $lines.Add("Tiles=$tiles Runs=$runs Samples=$samples")
     $lines.Add('LibrarySHA256=' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($so))))
@@ -246,7 +248,72 @@ try {
         finally { $listener.Dispose(); if ([IO.File]::Exists($tokenPath)) { [IO.File]::Delete($tokenPath) } }
         $passed = $true
     }
-    if ($speech) {
+    if ($procedural) {
+        # Direct Procedural Mode: stream pre-quantized 512-channel croutons and pitch curve directly
+        # Zero ALBERT, zero Decoder calls. Runs purely on Hexagon Generator Tail.
+        $generatorTables = [IO.File]::ReadAllBytes([IO.Path]::Combine($dir, 'tables.bin'))
+        $generatorWeights = [IO.File]::ReadAllBytes([IO.Path]::Combine($dir, 'weights.bin'))
+        $proceduralCroutons = [IO.File]::ReadAllBytes([IO.Path]::Combine($dir, 'procedural-croutons.bin'))
+        $f0Bytes = [IO.File]::ReadAllBytes([IO.Path]::Combine($dir, 'procedural-f0.bin'))
+        $speechTicks = [int]($f0Bytes.Length / 4)
+        $pitch = [float[]]::new($speechTicks)
+        [Buffer]::BlockCopy($f0Bytes, 0, $pitch, 0, $f0Bytes.Length)
+        
+        $noiseOffset = if ($kv.ContainsKey('NoiseOffset')) { [long]$kv.NoiseOffset } else { 986880L }
+        $noiseScale = if ($kv.ContainsKey('NoiseScale')) { [int]$kv.NoiseScale } else { 5417 }
+        $seed = if ($kv.ContainsKey('Seed')) { [uint32]$kv.Seed } else { 1u }
+        
+        $wave = [IO.Path]::Combine($dir, 'speech.wav')
+        if ([IO.File]::Exists($wave)) { [IO.File]::Delete($wave) }
+        $speechPcm = $null; $speechHash = $null; $allOk = $true
+        
+        Import-Module ([IO.Path]::Combine($root, 'Kokoro.CaptureKernels.psm1'))
+        
+        for ($run = 0; $run -lt $runs; $run++) {
+            $total = [Diagnostics.Stopwatch]::StartNew()
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $generatorInput = ConvertTo-KokoroGeneratorInput -XCroutons $proceduralCroutons -Pitch $pitch -Ticks $speechTicks -InputBytes ([long]$kv.InputBytes) -NoiseOffset $noiseOffset -Seed $seed -NoiseScale $noiseScale
+            $packMs = $clock.Elapsed.TotalMilliseconds
+            
+            $clock.Restart()
+            $generatorJob = & $runJob $handle $tiles $generatorInput $generatorWeights $generatorTables $outputBytes $pcmOffset $samples 1 -PcmOnly
+            $generatorMs = $clock.Elapsed.TotalMilliseconds
+            
+            if (-not $generatorJob.Ok) { throw "Generator job failed: $($generatorJob.Lines -join ' ')" }
+            $pcm = ConvertFrom-KokoroPcm16 -Output $generatorJob.Output -Offset 0 -Samples $samples
+            $hash = $generatorJob.PcmSHA256
+            $totalMs = $total.Elapsed.TotalMilliseconds
+            
+            if ($run -eq 0) {
+                $speechHash = $hash; $speechPcm = $pcm
+                # Write 24 kHz WAV
+                $ms = [IO.MemoryStream]::new(); $bw = [IO.BinaryWriter]::new($ms)
+                $n = $samples
+                $bw.Write([Text.Encoding]::ASCII.GetBytes('RIFF')); $bw.Write([int](36 + 2 * $n)); $bw.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt '))
+                $bw.Write([int]16); $bw.Write([int16]1); $bw.Write([int16]1); $bw.Write([int]24000); $bw.Write([int]48000); $bw.Write([int16]2); $bw.Write([int16]16)
+                $bw.Write([Text.Encoding]::ASCII.GetBytes('data')); $bw.Write([int](2 * $n))
+                $rawPcmBytes = [byte[]]::new(2 * $n)
+                [Buffer]::BlockCopy($generatorJob.Output, $pcmOffset, $rawPcmBytes, 0, 2 * $n)
+                $bw.Write($rawPcmBytes, 0, 2 * $n); $bw.Flush()
+                [IO.File]::WriteAllBytes($wave, $ms.ToArray())
+            } elseif ($hash -cne $speechHash) { $allOk = $false }
+            
+            $lines.Add("ProceduralSpeech Run=$run Ticks=$speechTicks AudioSeconds=$(($samples / 24000.0).ToString('F3', $inv)) PackMs=$($packMs.ToString('F2', $inv)) GeneratorDspMs=$($generatorJob.MedianMs.ToString('F2', $inv)) TotalMs=$($totalMs.ToString('F2', $inv)) PcmSHA256=$hash")
+            [IO.File]::WriteAllLines($receipt, $lines)
+        }
+        
+        $lines.Add("SpeechWav=speech.wav SHA256=$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($wave))))")
+        if ($allOk) {
+            $audio = & $load 'Audio.AAudio.psm1' @($abi)
+            $stream = & $audio.Open 24000 1
+            $playClock = [Diagnostics.Stopwatch]::StartNew()
+            $written = & $audio.Write $stream $speechPcm $playClock
+            $drain = & $audio.Drain $stream 30000
+            $lines.Add("Played=True WrittenFrames=$written DrainResult=$drain PlaybackMs=$($playClock.Elapsed.TotalMilliseconds.ToString('F1', $inv))")
+        }
+        $passed = $allOk
+    }
+    elseif ($speech) {
         # Text to WAV in this runspace: our phonemizer, the stock front end (the host port in Library mode, its numeric
         # kernels prebuilt on the host) on the CPU, then the decoder in chunks and this job's depth-first generator on the
         # DSP, both packed by Kokoro.CaptureKernels.psm1 as the host renderer packs them. speech-pack.json (written by
@@ -337,7 +404,7 @@ try {
         }
         finally { $null = $close.DynamicInvoke([object[]]@($decoderHandle)); Remove-Module -ModuleInfo $port -Force }
     }
-    if (-not $serve -and -not $speech) {
+    if (-not $serve -and -not $speech -and -not $procedural) {
     $act = [IO.File]::ReadAllBytes([IO.Path]::Combine($dir, 'activations.bin'))
     if ($kv.ContainsKey('WeightAssembly')) {
         if (-not $kv.ContainsKey('ResidentPayloads')) { throw 'Mapped weight assembly requires resident payload transport.' }
