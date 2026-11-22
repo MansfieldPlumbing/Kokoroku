@@ -293,7 +293,7 @@ try {
                 $bw.Write([int]16); $bw.Write([int16]1); $bw.Write([int16]1); $bw.Write([int]24000); $bw.Write([int]48000); $bw.Write([int16]2); $bw.Write([int16]16)
                 $bw.Write([Text.Encoding]::ASCII.GetBytes('data')); $bw.Write([int](2 * $n))
                 $rawPcmBytes = [byte[]]::new(2 * $n)
-                [Buffer]::BlockCopy($generatorJob.Output, $pcmOffset, $rawPcmBytes, 0, 2 * $n)
+                [Buffer]::BlockCopy($generatorJob.Output, 0, $rawPcmBytes, 0, 2 * $n)
                 $bw.Write($rawPcmBytes, 0, 2 * $n); $bw.Flush()
                 [IO.File]::WriteAllBytes($wave, $ms.ToArray())
             } elseif ($hash -cne $speechHash) { $allOk = $false }
