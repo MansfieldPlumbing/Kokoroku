@@ -124,6 +124,17 @@ The current **48 kHz FM-air examples are offline auditions**, derived from the m
 | [`tools/experiments/generator-throughput-20261119`](tools/experiments/generator-throughput-20261119) | Reconstructible optimization candidates and per-invocation timing |
 | [`docs/results`](docs/results) | Measurements, failures, and hardware investigations |
 
+## Upstream PSC integration
+
+The [PSC integration roadmap](https://github.com/MansfieldPlumbing/PSC#integration-roadmap) coordinates extraction of reusable mechanisms, with Kokoroku retained as an independent numerical and hardware validation target.
+
+- **D4 — Hexagon:** [instruction forms, encoding, packet grouping and ELF emission](Invoke-HexagonDevelopment.ps1). The catalog includes scalar, HVX and HMX forms; general duplex and extender coverage is not established. Acquisition must preserve emitted-byte parity and device results.
+- **D5 — SIMD:** [offline numerical kernels](tools/Invoke-KokoroPrecomputedDecoder.ps1) contain typed Vector128, Vector256 and Vector512 operations, packing and parallel workers. The [ARM64 phone receipt](docs/results/frontend-phone-cpu-sm8550-20261027.md) records portable Vector128 acceleration; Vector256 was not hardware-accelerated on that runtime. These kernels are evidence for portable numerical operations, not a claim of a complete NEON or AVX instruction emitter.
+- **X5 — Percepts:** [Providence.Field](student/Providence.Field.psm1) implements referent-bound observations, capability composition, withdrawal and restoration; [the compiled percept seed](student/seed/README.md) documents typed static graph realization and retained reference identity. Speech-specific controls, weights and generator schedules remain application-owned.
+- **I4 — checkpoint intake:** model reading and weight preparation are candidates for format-independent intake and typed data realization.
+
+These are acquisition candidates, not claims that PSC already contains the mechanisms. Preserve the existing exact-PCM and timing contracts when reconverging on shared implementations.
+
 ## Research integrity
 
 Every throughput number needs a **device, input duration, timing boundary, implementation, and audio-quality contract**. Generator-only measurements cannot be ranked directly against full text-to-speech timings on other systems. A faster variant that changes the waveform is reported as such, not folded into the exact-PCM result.
