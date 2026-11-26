@@ -103,6 +103,18 @@ param(
     [string] $CompiledAssembly = '',
     # Additional original voice-pack pins, supplied by the caller's verified catalog.
     [Collections.Generic.Dictionary[string,string]] $VoicePins = $null,
+    [switch] $AlbertWideDense,
+    [switch] $AlbertTiledDense,
+    [switch] $AlbertRegisterDense,
+    [switch] $AlbertWideInput,
+    [switch] $AlbertExpansionDense,
+    [switch] $AlbertFusedFfn,
+    [ValidateRange(12,384)][int] $AlbertFfnTileRows = 24,
+    [switch] $AlbertWideAttention,
+    [switch] $AlbertBlockedAttention,
+    [switch] $AlbertParallelGelu,
+    [switch] $VectorLstmProjection,
+    [switch] $VectorLstmRecurrence,
     [switch] $ReuseText,
     [ValidateRange(1,65536)][int] $TextPreparationCapacity = 1,
     [switch] $h
@@ -2168,7 +2180,193 @@ function Invoke-OfflineGenerator([float[]] $Features, [float[]] $AcousticStyle, 
     if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke('generator.waveform', 'sample@24000', $waveform.Length, $waveform) }
     return , $waveform
 }
-function Invoke-OfflineLstm([float[]] $Rows, [int] $rowCount, [string] $Prefix) {
+# Exact FP64 projection: four independent output gates per SIMD vector.
+# The accumulated terms remain in input-channel order; no FMA or horizontal reduction.
+class OfflineLstmProjectionJob {
+    [float[]] $Input
+    [System.Runtime.Intrinsics.Vector256[double][]] $Weights
+    [System.Runtime.Intrinsics.Vector128[float][]] $CompactWeights
+    [System.Runtime.Intrinsics.Vector256[double][]] $Bias
+    [double[]] $Output
+    [int] $Rows
+    [int] $Inputs
+    [int] $Gates
+    [int] $Direction
+    [int] $FirstBlock
+    [int] $LastBlock
+}
+function New-OfflineLstmProjectionMethod([bool]$Compact = $false) {
+    $v=[System.Runtime.Intrinsics.Vector256[double]]
+    $vt=[System.Runtime.Intrinsics.Vector256]
+    $job=[OfflineLstmProjectionJob]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactLstmProjection',[void],[type[]]@($job),$job,$true)
+    $il=$dm.GetILGenerator(); $op=[Reflection.Emit.OpCodes]
+    $loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){
+        $loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])
+    }
+    foreach($n in 'b','t','i','wb','xb','ob','globalBlock'){$loc.Add($n,$il.DeclareLocal([int]))}
+    $loc.Add('sum',$il.DeclareLocal($v))
+    $create=$vt.GetMethod('Create',[type[]]@([double]))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double])
+    $mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $get=($vt.GetMethods()|Where-Object {$_.Name -eq 'GetElement' -and $_.IsGenericMethodDefinition})[0].MakeGenericMethod([double])
+    $bl=$il.DefineLabel();$be=$il.DefineLabel();$tl=$il.DefineLabel();$te=$il.DefineLabel();$ilp=$il.DefineLabel();$ie=$il.DefineLabel()
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])}
+    function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])}
+    function C([int]$n){$il.Emit($op::Ldc_I4,$n)}
+    function Inc([string]$n){LD $n;C 1;$il.Emit($op::Add);ST $n}
+    LD FirstBlock;ST b
+    $il.MarkLabel($bl); LD b;LD LastBlock;$il.Emit($op::Bge,$be)
+    LD Direction;LD Gates;C 4;$il.Emit($op::Div);$il.Emit($op::Mul);LD b;$il.Emit($op::Add);ST globalBlock
+    LD globalBlock;LD Inputs;$il.Emit($op::Mul);ST wb
+    C 0;ST t
+    $il.MarkLabel($tl);LD t;LD Rows;$il.Emit($op::Bge,$te)
+    LD Bias;LD globalBlock;$il.Emit($op::Ldelem,$v);ST sum
+    LD t;LD Inputs;$il.Emit($op::Mul);ST xb
+    C 0;ST i
+    $il.MarkLabel($ilp);LD i;LD Inputs;$il.Emit($op::Bge,$ie)
+    LD sum
+    if($Compact){
+        $w=[System.Runtime.Intrinsics.Vector128[float]]
+        $widen=[System.Runtime.Intrinsics.X86.Avx].GetMethod('ConvertToVector256Double',[type[]]@($w))
+        LD CompactWeights;LD wb;LD i;$il.Emit($op::Add);$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen)
+    } else { LD Weights;LD wb;LD i;$il.Emit($op::Add);$il.Emit($op::Ldelem,$v) }
+    LD Input;LD xb;LD i;$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Call,$create)
+    $il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST sum
+    Inc i;$il.Emit($op::Br,$ilp);$il.MarkLabel($ie)
+    LD Direction;LD Rows;$il.Emit($op::Mul);LD t;$il.Emit($op::Add);LD Gates;$il.Emit($op::Mul);LD b;C 4;$il.Emit($op::Mul);$il.Emit($op::Add);ST ob
+    for($lane=0;$lane -lt 4;$lane++){LD Output;LD ob;C $lane;$il.Emit($op::Add);LD sum;C $lane;$il.Emit($op::Call,$get);$il.Emit($op::Stelem_R8)}
+    Inc t;$il.Emit($op::Br,$tl);$il.MarkLabel($te);Inc b;$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ret)
+    return $dm
+}
+function Invoke-OfflineVectorLstmProjection([float[]]$Rows,[int]$RowCount,[int]$Inputs,[int]$Hidden,[string]$Prefix,[object[]]$Parts,[double[]]$Projection){
+    $gates=4*$Hidden
+    if($gates%4 -ne 0 -or $Rows.Length -ne $RowCount*$Inputs -or $Projection.Length -ne 2*$RowCount*$gates){throw 'Invalid vector projection shape.'}
+    $compact=$VectorLstmRecurrence -and [System.Runtime.Intrinsics.X86.Avx]::IsSupported
+    $cache=$script:OfflineLstmVectorCache; $method=$script:OfflineLstmProjectionMethod
+    if($compact){
+        $cache=$script:OfflineLstmCompactProjectionCache
+        if($null -eq $script:OfflineLstmCompactPacker){$script:OfflineLstmCompactPacker=New-OfflineLstmCompactPacker}
+        if($null -eq $script:OfflineLstmCompactProjectionMethod){$script:OfflineLstmCompactProjectionMethod=New-OfflineLstmProjectionMethod $true}
+        $method=$script:OfflineLstmCompactProjectionMethod
+    }
+    if(!$cache.ContainsKey($Prefix)){
+        $weights=$null
+        if($compact){$weights=$script:OfflineLstmCompactPacker.Invoke($Parts[0],2*$gates,$Inputs)}else{$weights=$denseWorker::Pack($Parts[0],2*$gates,$Inputs)}
+        $bias=[System.Runtime.Intrinsics.Vector256[double][]]::new(2*$gates/4)
+        for($b=0;$b -lt $bias.Length;$b++){
+            $i=4*$b
+            $bias[$b]=[System.Runtime.Intrinsics.Vector256]::Create(([double]$Parts[2][$i]+[double]$Parts[3][$i]),([double]$Parts[2][$i+1]+[double]$Parts[3][$i+1]),([double]$Parts[2][$i+2]+[double]$Parts[3][$i+2]),([double]$Parts[2][$i+3]+[double]$Parts[3][$i+3]))
+        }
+        $cache.Add($Prefix,[Tuple[object,System.Runtime.Intrinsics.Vector256[double][]]]::new($weights,$bias))
+    }
+    $packed=$cache[$Prefix];$blocks=$gates/4;$count=[Math]::Min($Threads,2*$blocks)
+    $tasks=[Collections.Generic.List[Threading.Tasks.Task]]::new()
+    for($d=0;$d -lt 2;$d++){
+        $pieces=[Math]::Max(1,[int][Math]::Floor(($count+$d)/2))
+        for($p=0;$p -lt $pieces;$p++){
+            $job=[OfflineLstmProjectionJob]::new();$job.Input=$Rows;if($compact){$job.CompactWeights=$packed.Item1}else{$job.Weights=$packed.Item1};$job.Bias=$packed.Item2;$job.Output=$Projection;$job.Rows=$RowCount;$job.Inputs=$Inputs;$job.Gates=$gates;$job.Direction=$d
+            $job.FirstBlock=[int][Math]::Floor($p*$blocks/$pieces);$job.LastBlock=[int][Math]::Floor(($p+1)*$blocks/$pieces)
+            $tasks.Add([Threading.Tasks.Task]::Run($method.CreateDelegate([Action],$job)))
+        }
+    }
+    [Threading.Tasks.Task]::WaitAll($tasks.ToArray())
+}
+$script:OfflineLstmVectorCache=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+$script:OfflineLstmProjectionMethod=$null
+
+# Compact four-gate panels preserve checkpoint FP32 weights; widen on load.
+# AVX is required for this realization. Non-AVX and traced calls use the existing worker.
+class OfflineLstmRecurrenceJob {
+    [double[]] $Projection
+    [System.Runtime.Intrinsics.Vector128[float][]] $Weights
+    [float[]] $Output
+    [int] $Rows
+    [int] $Hidden
+    [int] $Direction
+}
+function New-OfflineLstmCompactPacker {
+    $v=[System.Runtime.Intrinsics.Vector128[float]]; $vt=[System.Runtime.Intrinsics.Vector128]; $op=[Reflection.Emit.OpCodes]
+    $dm=[Reflection.Emit.DynamicMethod]::new('PackLstmFloat32',$v.MakeArrayType(),[type[]]@([float[]],[int],[int]),$true)
+    $il=$dm.GetILGenerator();$r=$il.DeclareLocal($v.MakeArrayType());$b=$il.DeclareLocal([int]);$i=$il.DeclareLocal([int]);$at=$il.DeclareLocal([int]);$n=$il.DeclareLocal([int]);$blocks=$il.DeclareLocal([int])
+    $create=$vt.GetMethod('Create',[type[]]@([float],[float],[float],[float]));$bl=$il.DefineLabel();$be=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    $il.Emit($op::Ldarg_1);$il.Emit($op::Ldc_I4_4);$il.Emit($op::Div);$il.Emit($op::Stloc,$blocks)
+    $il.Emit($op::Ldloc,$blocks);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Newarr,$v);$il.Emit($op::Stloc,$r)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$b);$il.MarkLabel($bl);$il.Emit($op::Ldloc,$b);$il.Emit($op::Ldloc,$blocks);$il.Emit($op::Bge,$be)
+    $il.Emit($op::Ldloc,$b);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Stloc,$at)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$i);$il.MarkLabel($loop);$il.Emit($op::Ldloc,$i);$il.Emit($op::Ldarg_2);$il.Emit($op::Bge,$end)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldloc,$at);$il.Emit($op::Ldloc,$i);$il.Emit($op::Add)
+    for($lane=0;$lane -lt 4;$lane++){
+        $il.Emit($op::Ldarg_0);$il.Emit($op::Ldloc,$b);$il.Emit($op::Ldc_I4_4);$il.Emit($op::Mul);$il.Emit($op::Ldc_I4,[int]$lane);$il.Emit($op::Add);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Ldloc,$i);$il.Emit($op::Add);$il.Emit($op::Ldelem_R4)
+    }
+    $il.Emit($op::Call,$create);$il.Emit($op::Stelem,$v)
+    $il.Emit($op::Ldloc,$i);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$i);$il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    $il.Emit($op::Ldloc,$b);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$b);$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ldloc,$r);$il.Emit($op::Ret)
+    return $dm.CreateDelegate([Func[float[],int,int,System.Runtime.Intrinsics.Vector128[float][]]])
+}
+function New-OfflineLstmRecurrenceMethod {
+    $v=[System.Runtime.Intrinsics.Vector256[double]];$vt=[System.Runtime.Intrinsics.Vector256];$w=[System.Runtime.Intrinsics.Vector128[float]];$op=[Reflection.Emit.OpCodes];$job=[OfflineLstmRecurrenceJob]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactLstmRecurrence',[void],[type[]]@($job),$job,$true)
+    $il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'step','t','b','i','j','gates','at','wb','ob','base','blocks'){$loc.Add($n,$il.DeclareLocal([int]))}
+    foreach($n in 'state','cell','pre'){$loc.Add($n,$il.DeclareLocal([double[]]))}
+    foreach($n in 'ig','fg','cg','og','c','h'){$loc.Add($n,$il.DeclareLocal([double]))}
+    $loc.Add('sum',$il.DeclareLocal($v))
+    $create=$vt.GetMethod('Create',[type[]]@([double]));$create4=$vt.GetMethod('Create',[type[]]@([double],[double],[double],[double]));$widen=[System.Runtime.Intrinsics.X86.Avx].GetMethod('ConvertToVector256Double',[type[]]@($w))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double])
+    $mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $get=($vt.GetMethods()|Where-Object {$_.Name -eq 'GetElement' -and $_.IsGenericMethodDefinition})[0].MakeGenericMethod([double]);$exp=[Math].GetMethod('Exp',[type[]]@([double]));$tanh=[Math].GetMethod('Tanh',[type[]]@([double]))
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function Inc([string]$n){LD $n;C 1;$il.Emit($op::Add);ST $n};function D1{$il.Emit($op::Ldc_R8,[double]1)}
+    $sl=$il.DefineLabel();$se=$il.DefineLabel();$forward=$il.DefineLabel();$bl=$il.DefineLabel();$be=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel();$jl=$il.DefineLabel();$je=$il.DefineLabel()
+    LD Hidden;C 4;$il.Emit($op::Mul);ST gates; LD Hidden;ST blocks
+    foreach($n in 'state','cell'){LD Hidden;$il.Emit($op::Newarr,[double]);ST $n};LD gates;$il.Emit($op::Newarr,[double]);ST pre
+    C 0;ST step;$il.MarkLabel($sl);LD step;LD Rows;$il.Emit($op::Bge,$se)
+    LD step;ST t;LD Direction;$il.Emit($op::Brfalse,$forward);LD Rows;C 1;$il.Emit($op::Sub);LD step;$il.Emit($op::Sub);ST t;$il.MarkLabel($forward)
+    LD Direction;LD Rows;$il.Emit($op::Mul);LD t;$il.Emit($op::Add);LD gates;$il.Emit($op::Mul);ST at
+    C 0;ST b;$il.MarkLabel($bl);LD b;LD blocks;$il.Emit($op::Bge,$be)
+    LD Direction;LD blocks;$il.Emit($op::Mul);LD b;$il.Emit($op::Add);LD Hidden;$il.Emit($op::Mul);ST wb
+    LD b;C 4;$il.Emit($op::Mul);ST base
+    for($lane=0;$lane -lt 4;$lane++){LD Projection;LD at;LD base;$il.Emit($op::Add);C $lane;$il.Emit($op::Add);$il.Emit($op::Ldelem_R8)}
+    $il.Emit($op::Call,$create4);ST sum
+    C 0;ST i;$il.MarkLabel($loop);LD i;LD Hidden;$il.Emit($op::Bge,$end)
+    LD sum;LD Weights;LD wb;LD i;$il.Emit($op::Add);$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen);LD state;LD i;$il.Emit($op::Ldelem_R8);$il.Emit($op::Call,$create);$il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST sum
+    Inc i;$il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    for($lane=0;$lane -lt 4;$lane++){LD pre;LD base;C $lane;$il.Emit($op::Add);LD sum;C $lane;$il.Emit($op::Call,$get);$il.Emit($op::Stelem_R8)}
+    Inc b;$il.Emit($op::Br,$bl);$il.MarkLabel($be)
+    C 0;ST j;$il.MarkLabel($jl);LD j;LD Hidden;$il.Emit($op::Bge,$je)
+    for($g=0;$g -lt 4;$g++){
+        if($g -ne 2){D1;D1}
+        LD pre;LD j;LD Hidden;C $g;$il.Emit($op::Mul);$il.Emit($op::Add);$il.Emit($op::Ldelem_R8)
+        if($g -eq 2){$il.Emit($op::Call,$tanh)}else{$il.Emit($op::Neg);$il.Emit($op::Call,$exp);$il.Emit($op::Add);$il.Emit($op::Div)}
+        ST (@('ig','fg','cg','og')[$g])
+    }
+    LD fg;LD cell;LD j;$il.Emit($op::Ldelem_R8);$il.Emit($op::Mul);LD ig;LD cg;$il.Emit($op::Mul);$il.Emit($op::Add);ST c
+    LD cell;LD j;LD c;$il.Emit($op::Stelem_R8);LD og;LD c;$il.Emit($op::Call,$tanh);$il.Emit($op::Mul);ST h
+    LD state;LD j;LD h;$il.Emit($op::Stelem_R8)
+    LD Output;LD t;LD Hidden;C 2;$il.Emit($op::Mul);$il.Emit($op::Mul);LD Direction;LD Hidden;$il.Emit($op::Mul);$il.Emit($op::Add);LD j;$il.Emit($op::Add);LD h;$il.Emit($op::Conv_R4);$il.Emit($op::Stelem_R4)
+    Inc j;$il.Emit($op::Br,$jl);$il.MarkLabel($je);Inc step;$il.Emit($op::Br,$sl);$il.MarkLabel($se);$il.Emit($op::Ret)
+    return $dm
+}
+function Invoke-OfflineVectorLstmRecurrence([double[]]$Projection,[int]$Rows,[int]$Hidden,[string]$Prefix,[float[]]$Weights,[float[]]$Output){
+    if($null -eq $script:OfflineLstmCompactPacker){$script:OfflineLstmCompactPacker=New-OfflineLstmCompactPacker}
+    if($null -eq $script:OfflineLstmRecurrenceMethod){$script:OfflineLstmRecurrenceMethod=New-OfflineLstmRecurrenceMethod}
+    if(!$script:OfflineLstmRecurrentCache.ContainsKey($Prefix)){$script:OfflineLstmRecurrentCache.Add($Prefix,$script:OfflineLstmCompactPacker.Invoke($Weights,8*$Hidden,$Hidden))}
+    $running=[Collections.Generic.List[Threading.Tasks.Task]]::new()
+    for($direction=0;$direction -lt 2;$direction++){
+        $job=[OfflineLstmRecurrenceJob]::new();$job.Projection=$Projection;$job.Weights=$script:OfflineLstmRecurrentCache[$Prefix];$job.Rows=$Rows;$job.Hidden=$Hidden;$job.Direction=$direction;$job.Output=$Output
+        $running.Add([Threading.Tasks.Task]::Run($script:OfflineLstmRecurrenceMethod.CreateDelegate([Action],$job)))
+    }
+    [Threading.Tasks.Task]::WaitAll($running.ToArray())
+}
+$script:OfflineLstmCompactProjectionCache=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+$script:OfflineLstmCompactProjectionMethod=$null
+$script:OfflineLstmCompactPacker=$null
+$script:OfflineLstmRecurrenceMethod=$null
+$script:OfflineLstmRecurrentCache=[Collections.Generic.Dictionary[string,System.Runtime.Intrinsics.Vector128[float][]]]::new([StringComparer]::Ordinal)
+
+function Invoke-OfflineLstm([float[]] $Rows, [int] $rowCount, [string] $Prefix, [int[]] $RepeatDurations = $null) {
     $stageWatch = [Diagnostics.Stopwatch]::StartNew()
     # Stock bidirectional nn.LSTM: forward weights followed by the _reverse weights.
     if (-not $lstmCache.ContainsKey($Prefix)) {
@@ -2182,6 +2380,15 @@ function Invoke-OfflineLstm([float[]] $Rows, [int] $rowCount, [string] $Prefix) 
     }
     $parts = $lstmCache[$Prefix]
     $hidden = [int]($parts[2].Length / 8); $inputs = [int]($parts[0].Length / (8 * $hidden))
+    # The shared predictor's duration expansion repeats exact token rows.
+    # Project those rows once, then expand the double-precision gate inputs.
+    $projectionRows = $rowCount
+    if ($null -ne $RepeatDurations -and $RepeatDurations.Length -gt 0) {
+        if ($Dense -eq 'Scalar' -or $RepeatDurations.Length -ne $rowCount -or $Rows.Length -ne $rowCount * $inputs) { throw 'Invalid repeated LSTM projection geometry.' }
+        $rowCount = 0
+        foreach ($d in $RepeatDurations) { if ($d -lt 0) { throw 'Negative duration.' }; $rowCount += $d }
+        if ($rowCount -lt 1) { throw 'Empty repeated LSTM projection.' }
+    }
     $values = [float[]]::new($rowCount * 2 * $hidden)
     $recurrenceTrace=$null
     if ($null -ne $script:OfflineTensorSink) { $recurrenceTrace=[double[]]::new(12*$rowCount*$hidden) }
@@ -2190,24 +2397,45 @@ function Invoke-OfflineLstm([float[]] $Rows, [int] $rowCount, [string] $Prefix) 
     } else {
         # Input projections for every step first, split by gate across all threads; then one
         # recurrence per direction. Bit-identical to the single-pass scalar Lstm.
-        $gateCount = 4 * $hidden; $projection = [double[]]::new(2 * $rowCount * $gateCount)
+        $gateCount = 4 * $hidden; $projection = [double[]]::new(2 * $projectionRows * $gateCount)
         $perDirection = [Math]::Max(1, [int][Math]::Floor($Threads / 2))
         foreach ($phase in 0, 1) {
-            $running = [Collections.Generic.List[Threading.Tasks.Task]]::new(); $keepWorkers = [Collections.Generic.List[object]]::new()
-            for ($direction = 0; $direction -lt 2; $direction++) {
-                $pieces = 1; if ($phase -eq 0) { $pieces = $perDirection }
-                for ($piece = 0; $piece -lt $pieces; $piece++) {
-                    $worker = [Activator]::CreateInstance($lstmWorker)
-                    $worker.Values = $Rows; $worker.Rows = $rowCount; $worker.Inputs = $inputs; $worker.Hidden = $hidden
-                    $worker.InputWeights = $parts[0]; $worker.HiddenWeights = $parts[1]; $worker.InputBias = $parts[2]; $worker.HiddenBias = $parts[3]
-                    $worker.Output = $values; $worker.FirstDirection = $direction; $worker.LastDirection = $direction + 1
-                    $worker.Projection = $projection; $worker.Phase = $phase; $worker.RecurrenceTrace=$recurrenceTrace
-                    $worker.FirstGate = [int][Math]::Floor($piece * $gateCount / [double]$pieces)
-                    $worker.LastGate = [int][Math]::Floor(($piece + 1) * $gateCount / [double]$pieces)
-                    $keepWorkers.Add($worker); $running.Add([Threading.Tasks.Task]::Run($lstmWorker.GetMethod('Run').CreateDelegate([Action], $worker)))
+            if ($phase -eq 0 -and $VectorLstmProjection -and [System.Runtime.Intrinsics.Vector256]::IsHardwareAccelerated -and [System.Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported) {
+                if ($null -eq $script:OfflineLstmProjectionMethod) { $script:OfflineLstmProjectionMethod = New-OfflineLstmProjectionMethod }
+                Invoke-OfflineVectorLstmProjection $Rows $projectionRows $inputs $hidden $Prefix $parts $projection
+            } elseif ($phase -eq 1 -and $VectorLstmRecurrence -and [System.Runtime.Intrinsics.X86.Avx]::IsSupported -and [System.Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported -and $null -eq $recurrenceTrace) {
+                Invoke-OfflineVectorLstmRecurrence $projection $rowCount $hidden $Prefix $parts[1] $values
+            } else {
+                $running = [Collections.Generic.List[Threading.Tasks.Task]]::new(); $keepWorkers = [Collections.Generic.List[object]]::new()
+                for ($direction = 0; $direction -lt 2; $direction++) {
+                    $pieces = 1; if ($phase -eq 0) { $pieces = $perDirection }
+                    for ($piece = 0; $piece -lt $pieces; $piece++) {
+                        $worker = [Activator]::CreateInstance($lstmWorker)
+                        $worker.Values = $Rows; $worker.Rows = $(if ($phase -eq 0) { $projectionRows } else { $rowCount }); $worker.Inputs = $inputs; $worker.Hidden = $hidden
+                        $worker.InputWeights = $parts[0]; $worker.HiddenWeights = $parts[1]; $worker.InputBias = $parts[2]; $worker.HiddenBias = $parts[3]
+                        $worker.Output = $values; $worker.FirstDirection = $direction; $worker.LastDirection = $direction + 1
+                        $worker.Projection = $projection; $worker.Phase = $phase; $worker.RecurrenceTrace=$recurrenceTrace
+                        $worker.FirstGate = [int][Math]::Floor($piece * $gateCount / [double]$pieces)
+                        $worker.LastGate = [int][Math]::Floor(($piece + 1) * $gateCount / [double]$pieces)
+                        $keepWorkers.Add($worker); $running.Add([Threading.Tasks.Task]::Run($lstmWorker.GetMethod('Run').CreateDelegate([Action], $worker)))
+                    }
                 }
+                [Threading.Tasks.Task]::WaitAll($running.ToArray())
             }
-            [Threading.Tasks.Task]::WaitAll($running.ToArray())
+            if ($phase -eq 0 -and $null -ne $RepeatDurations -and $RepeatDurations.Length -gt 0) {
+                $expanded = [double[]]::new(2 * $rowCount * $gateCount)
+                for ($direction = 0; $direction -lt 2; $direction++) {
+                    $dst = $direction * $rowCount * $gateCount
+                    for ($token = 0; $token -lt $projectionRows; $token++) {
+                        $src = ($direction * $projectionRows + $token) * $gateCount
+                        for ($k = 0; $k -lt $RepeatDurations[$token]; $k++) {
+                            [Array]::Copy($projection, $src, $expanded, $dst, $gateCount)
+                            $dst += $gateCount
+                        }
+                    }
+                }
+                $projection = $expanded
+            }
         }
     }
     if ($null -ne $script:OfflineTensorSink) {
@@ -2223,7 +2451,240 @@ function Invoke-OfflineLstm([float[]] $Rows, [int] $rowCount, [string] $Prefix) 
     }
     return , $values
 }
-function Invoke-OfflineLinear([float[]] $Rows, [int] $rowCount, [string] $Prefix) {
+# Exact ALBERT dense kernel: FP32 packed weights, sequential FP64 accumulation.
+class OfflineAlbertDenseJob {
+    [double[]] $Output64
+    [int] $OutputRowOffset
+    [float[]] $Input
+    [double[]] $Input64
+    [System.Runtime.Intrinsics.Vector256[float][]] $Packed
+    [System.Runtime.Intrinsics.Vector256[float][]] $Bias
+    [float[]] $Output
+    [int] $Rows
+    [int] $InputChannels
+    [int] $OutputChannels
+    [int] $FirstBlock
+    [int] $LastBlock
+}
+function New-OfflineAlbertDensePacker {
+    $v=[System.Runtime.Intrinsics.Vector256[float]];$vt=[System.Runtime.Intrinsics.Vector256];$op=[Reflection.Emit.OpCodes]
+    $dm=[Reflection.Emit.DynamicMethod]::new('PackAlbertFloat32',$v.MakeArrayType(),[type[]]@([float[]],[int],[int]),$true)
+    $il=$dm.GetILGenerator();$r=$il.DeclareLocal($v.MakeArrayType());$b=$il.DeclareLocal([int]);$i=$il.DeclareLocal([int]);$blocks=$il.DeclareLocal([int]);$at=$il.DeclareLocal([int])
+    $create=$vt.GetMethod('Create',[type[]]@([float],[float],[float],[float],[float],[float],[float],[float]));$bl=$il.DefineLabel();$be=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    $il.Emit($op::Ldarg_1);$il.Emit($op::Ldc_I4_8);$il.Emit($op::Div);$il.Emit($op::Stloc,$blocks)
+    $il.Emit($op::Ldloc,$blocks);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Newarr,$v);$il.Emit($op::Stloc,$r)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$b);$il.MarkLabel($bl);$il.Emit($op::Ldloc,$b);$il.Emit($op::Ldloc,$blocks);$il.Emit($op::Bge,$be)
+    $il.Emit($op::Ldloc,$b);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Stloc,$at)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$i);$il.MarkLabel($loop);$il.Emit($op::Ldloc,$i);$il.Emit($op::Ldarg_2);$il.Emit($op::Bge,$end)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldloc,$at);$il.Emit($op::Ldloc,$i);$il.Emit($op::Add)
+    for($lane=0;$lane -lt 8;$lane++){
+        $il.Emit($op::Ldarg_0);$il.Emit($op::Ldloc,$b);$il.Emit($op::Ldc_I4_8);$il.Emit($op::Mul);$il.Emit($op::Ldc_I4,[int]$lane);$il.Emit($op::Add);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Ldloc,$i);$il.Emit($op::Add);$il.Emit($op::Ldelem_R4)
+    }
+    $il.Emit($op::Call,$create);$il.Emit($op::Stelem,$v)
+    $il.Emit($op::Ldloc,$i);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$i);$il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    $il.Emit($op::Ldloc,$b);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$b);$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ldloc,$r);$il.Emit($op::Ret)
+    return $dm.CreateDelegate([Func[float[],int,int,System.Runtime.Intrinsics.Vector256[float][]]])
+}
+function New-OfflineAlbertDenseMethod {
+    $v=[System.Runtime.Intrinsics.Vector512[double]];$vt=[System.Runtime.Intrinsics.Vector512];$w=[System.Runtime.Intrinsics.Vector256[float]];$op=[Reflection.Emit.OpCodes];$job=[OfflineAlbertDenseJob];$avx=[System.Runtime.Intrinsics.X86.Avx512F]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactAlbertDense8x8',[void],[type[]]@($job),$job,$true)
+    $il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'b','r','i','wb','xb','ob'){$loc.Add($n,$il.DeclareLocal([int]))}
+    foreach($n in @('weight','bias')+@(0..7|%{"s$_"})){$loc.Add($n,$il.DeclareLocal($v))}
+    $create=$vt.GetMethod('Create',[type[]]@([double]));$widen=$avx.GetMethod('ConvertToVector512Double',[type[]]@($w));$narrow=$avx.GetMethod('ConvertToVector256Single',[type[]]@($v))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double])
+    $mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $store=([System.Runtime.Intrinsics.Vector256].GetMethods()|Where-Object {$_.Name -eq 'StoreUnsafe' -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([float])
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function Inc([string]$n,[int]$step=1){LD $n;C $step;$il.Emit($op::Add);ST $n}
+    $bl=$il.DefineLabel();$be=$il.DefineLabel();$rl=$il.DefineLabel();$re=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    LD FirstBlock;ST b;$il.MarkLabel($bl);LD b;LD LastBlock;$il.Emit($op::Bge,$be)
+    LD b;LD InputChannels;$il.Emit($op::Mul);ST wb;LD b;C 8;$il.Emit($op::Mul);ST ob
+    LD Bias;LD b;$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen);ST bias
+    C 0;ST r;$il.MarkLabel($rl);LD r;LD Rows;$il.Emit($op::Bge,$re)
+    LD r;LD InputChannels;$il.Emit($op::Mul);ST xb
+    for($row=0;$row -lt 8;$row++){LD bias;ST "s$row"}
+    C 0;ST i;$il.MarkLabel($loop);LD i;LD InputChannels;$il.Emit($op::Bge,$end)
+    LD Packed;LD wb;LD i;$il.Emit($op::Add);$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen);ST weight
+    for($row=0;$row -lt 8;$row++){
+        LD "s$row";LD weight;LD Input;LD xb;LD i;$il.Emit($op::Add)
+        if($row -gt 0){LD InputChannels;C $row;$il.Emit($op::Mul);$il.Emit($op::Add)}
+        $il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Call,$create);$il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST "s$row"
+    }
+    Inc i;$il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    for($row=0;$row -lt 8;$row++){
+        $skip=$il.DefineLabel();LD r;C $row;$il.Emit($op::Add);LD Rows;$il.Emit($op::Bge,$skip)
+        LD "s$row";$il.Emit($op::Call,$narrow);LD Output;LD r;C $row;$il.Emit($op::Add);LD OutputChannels;$il.Emit($op::Mul);LD ob;$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$store);$il.MarkLabel($skip)
+    }
+    Inc r 8;$il.Emit($op::Br,$rl);$il.MarkLabel($re);Inc b;$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ret)
+    return $dm
+}
+function New-OfflineAlbertTiledMethod {
+    $v=[System.Runtime.Intrinsics.Vector512[double]];$vt=[System.Runtime.Intrinsics.Vector512];$w=[System.Runtime.Intrinsics.Vector256[float]];$op=[Reflection.Emit.OpCodes];$job=[OfflineAlbertDenseJob];$avx=[System.Runtime.Intrinsics.X86.Avx512F]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactAlbertDense16x8',[void],[type[]]@($job),$job,$true)
+    $il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'b','r','i','wb','xb','ob'){$loc.Add($n,$il.DeclareLocal([int]))}
+    foreach($n in @('weight','bias')+@(0..15|%{"s$_"})){$loc.Add($n,$il.DeclareLocal($v))}
+    $loc.Add('xptr',$il.DeclareLocal([float].MakeByRefType()));$loc.Add('wptr',$il.DeclareLocal($w.MakeByRefType()))
+    $unsafeAdd=([System.Runtime.CompilerServices.Unsafe].GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters()[0].ParameterType.IsByRef -and $_.GetParameters()[1].ParameterType -eq [int]})[0]
+    $xadd=$unsafeAdd.MakeGenericMethod([float]);$wadd=$unsafeAdd.MakeGenericMethod($w)
+    $fma=$avx.GetMethod('FusedMultiplyAdd',[type[]]@($v,$v,$v));$create=$vt.GetMethod('Create',[type[]]@([double]));$widen=$avx.GetMethod('ConvertToVector512Double',[type[]]@($w));$narrow=$avx.GetMethod('ConvertToVector256Single',[type[]]@($v))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double])
+    $mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $store=([System.Runtime.Intrinsics.Vector256].GetMethods()|Where-Object {$_.Name -eq 'StoreUnsafe' -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([float])
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function Inc([string]$n,[int]$step=1){LD $n;C $step;$il.Emit($op::Add);ST $n}
+    $bl=$il.DefineLabel();$be=$il.DefineLabel();$rl=$il.DefineLabel();$re=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    LD FirstBlock;ST b;$il.MarkLabel($bl);LD b;LD LastBlock;$il.Emit($op::Bge,$be)
+    LD b;LD InputChannels;$il.Emit($op::Mul);ST wb;LD b;C 8;$il.Emit($op::Mul);ST ob
+    LD Bias;LD b;$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen);ST bias
+    C 0;ST r;$il.MarkLabel($rl);LD r;LD Rows;$il.Emit($op::Bge,$re)
+    LD r;LD InputChannels;$il.Emit($op::Mul);ST xb
+    for($row=0;$row -lt 16;$row++){LD bias;ST "s$row"}
+    LD Input;LD xb;$il.Emit($op::Ldelema,[float]);ST xptr
+    LD Packed;LD wb;$il.Emit($op::Ldelema,$w);ST wptr
+    C 0;ST i;$il.MarkLabel($loop)
+    LD wptr;$il.Emit($op::Ldobj,$w);$il.Emit($op::Call,$widen);ST weight
+    for($row=0;$row -lt 16;$row++){
+        LD weight;LD xptr
+        if($row -gt 0){C $row;$il.Emit($op::Call,$xadd)}
+        $il.Emit($op::Ldind_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Call,$create);LD "s$row";$il.Emit($op::Call,$fma);ST "s$row"
+    }
+    Inc i;LD i;LD InputChannels;$il.Emit($op::Bge,$end);LD xptr;C 16;$il.Emit($op::Call,$xadd);ST xptr;LD wptr;C 1;$il.Emit($op::Call,$wadd);ST wptr;$il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    for($row=0;$row -lt 16;$row++){
+        $skip=$il.DefineLabel();LD r;C $row;$il.Emit($op::Add);LD Rows;$il.Emit($op::Bge,$skip)
+        LD "s$row";$il.Emit($op::Call,$narrow);LD Output;LD r;C $row;$il.Emit($op::Add);LD OutputChannels;$il.Emit($op::Mul);LD ob;$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$store);$il.MarkLabel($skip)
+    }
+    Inc r 16;$il.Emit($op::Br,$rl);$il.MarkLabel($re);Inc b;$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ret)
+    return $dm
+}
+function New-OfflineAlbertRegisterMethod([switch]$WideInput,[int]$TileRows=8,[int]$Groups=3,[switch]$GeluPackedOutput,[switch]$OutputOffset) {
+    $inputType=if($WideInput){[double]}else{[float]};$inputField=if($WideInput){'Input64'}else{'Input'}
+    $v=[System.Runtime.Intrinsics.Vector512[double]];$vt=[System.Runtime.Intrinsics.Vector512];$w=[System.Runtime.Intrinsics.Vector256[float]];$op=[Reflection.Emit.OpCodes];$job=[OfflineAlbertDenseJob];$avx=[System.Runtime.Intrinsics.X86.Avx512F]
+    $dm=[Reflection.Emit.DynamicMethod]::new(("ExactAlbertDense${TileRows}x$(8*$Groups)"),[void],[type[]]@($job),$job,$true)
+    $il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'b','r','i','wb','xb','ob'){$loc.Add($n,$il.DeclareLocal([int]))}
+    foreach($n in @('inputValue')+@(0..($Groups-1)|%{"weight$_";"bias$_"})+@(0..($TileRows*$Groups-1)|%{"s$_"})){$loc.Add($n,$il.DeclareLocal($v))}
+    if($GeluPackedOutput){
+        foreach($n in 'lane','rowIndex','outBase'){$loc.Add($n,$il.DeclareLocal([int]))}
+        $loc.Add('narrowed',$il.DeclareLocal($w));$loc.Add('scalar',$il.DeclareLocal([double]))
+        $getElement=([System.Runtime.Intrinsics.Vector256].GetMethods()|Where-Object {$_.Name -eq 'GetElement' -and $_.IsGenericMethodDefinition})[0].MakeGenericMethod([float])
+        $tanh=[Math].GetMethod('Tanh',[type[]]@([double]))
+    }
+    $loc.Add('xptr',$il.DeclareLocal($inputType.MakeByRefType()));for($g=0;$g -lt $Groups;$g++){$loc.Add("wptr$g",$il.DeclareLocal($w.MakeByRefType()))}
+    $unsafeAdd=([System.Runtime.CompilerServices.Unsafe].GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters()[0].ParameterType.IsByRef -and $_.GetParameters()[1].ParameterType -eq [int]})[0]
+    $xadd=$unsafeAdd.MakeGenericMethod($inputType);$wadd=$unsafeAdd.MakeGenericMethod($w)
+    $fma=$avx.GetMethod('FusedMultiplyAdd',[type[]]@($v,$v,$v));$create=$vt.GetMethod('Create',[type[]]@([double]));$widen=$avx.GetMethod('ConvertToVector512Double',[type[]]@($w));$narrow=$avx.GetMethod('ConvertToVector256Single',[type[]]@($v))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double])
+    $mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $store=([System.Runtime.Intrinsics.Vector256].GetMethods()|Where-Object {$_.Name -eq 'StoreUnsafe' -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([float])
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function Inc([string]$n,[int]$step=1){LD $n;C $step;$il.Emit($op::Add);ST $n}
+    $bl=$il.DefineLabel();$be=$il.DefineLabel();$rl=$il.DefineLabel();$re=$il.DefineLabel();$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    LD FirstBlock;ST b;$il.MarkLabel($bl);LD b;LD LastBlock;$il.Emit($op::Bge,$be)
+    LD b;LD InputChannels;$il.Emit($op::Mul);ST wb;LD b;C 8;$il.Emit($op::Mul);ST ob
+    for($g=0;$g -lt $Groups;$g++){LD Bias;LD b;if($g -ne 0){C $g;$il.Emit($op::Add)};$il.Emit($op::Ldelem,$w);$il.Emit($op::Call,$widen);ST "bias$g"}
+    C 0;ST r;$il.MarkLabel($rl);LD r;LD Rows;$il.Emit($op::Bge,$re)
+    LD r;LD InputChannels;$il.Emit($op::Mul);ST xb
+    for($row=0;$row -lt $TileRows;$row++){for($g=0;$g -lt $Groups;$g++){LD "bias$g";ST "s$($TileRows*$g+$row)"}}
+    LD $inputField;LD xb;$il.Emit($op::Ldelema,$inputType);ST xptr
+    LD Packed;LD wb;$il.Emit($op::Ldelema,$w);ST wptr0
+    for($g=1;$g -lt $Groups;$g++){LD "wptr$($g-1)";LD InputChannels;$il.Emit($op::Call,$wadd);ST "wptr$g"}
+    C 0;ST i;$il.MarkLabel($loop)
+    for($g=0;$g -lt $Groups;$g++){LD "wptr$g";$il.Emit($op::Ldobj,$w);$il.Emit($op::Call,$widen);ST "weight$g"}
+    for($row=0;$row -lt $TileRows;$row++){
+        LD xptr;if($row -gt 0){C $row;$il.Emit($op::Call,$xadd)}
+        if($WideInput){$il.Emit($op::Ldind_R8)}else{$il.Emit($op::Ldind_R4);$il.Emit($op::Conv_R8)};$il.Emit($op::Call,$create);ST inputValue
+        for($g=0;$g -lt $Groups;$g++){LD "weight$g";LD inputValue;LD "s$($TileRows*$g+$row)";$il.Emit($op::Call,$fma);ST "s$($TileRows*$g+$row)"}
+    }
+    Inc i;LD i;LD InputChannels;$il.Emit($op::Bge,$end);LD xptr;C $TileRows;$il.Emit($op::Call,$xadd);ST xptr
+    for($g=0;$g -lt $Groups;$g++){LD "wptr$g";C 1;$il.Emit($op::Call,$wadd);ST "wptr$g"}
+    $il.Emit($op::Br,$loop);$il.MarkLabel($end)
+    for($row=0;$row -lt $TileRows;$row++){
+        $skip=$il.DefineLabel();LD r;C $row;$il.Emit($op::Add);LD Rows;$il.Emit($op::Bge,$skip)
+        for($group=0;$group -lt $Groups;$group++){
+            if($GeluPackedOutput){
+                # Round expansion to FP32, apply original GELU, round to FP32 again,
+                # then write directly into the contraction's 8-row K-major FP64 tile.
+                LD "s$($TileRows*$group+$row)";$il.Emit($op::Call,$narrow);ST narrowed
+                LD r;C $row;$il.Emit($op::Add);ST rowIndex
+                LD rowIndex;C -8;$il.Emit($op::And);LD OutputChannels;$il.Emit($op::Mul);LD rowIndex;C 7;$il.Emit($op::And);$il.Emit($op::Add)
+                LD ob;C (8*$group);$il.Emit($op::Add);C 8;$il.Emit($op::Mul);$il.Emit($op::Add);ST outBase
+                C 0;ST lane;$ll=$il.DefineLabel();$le=$il.DefineLabel();$il.MarkLabel($ll);LD lane;C 8;$il.Emit($op::Bge,$le)
+                LD narrowed;LD lane;$il.Emit($op::Call,$getElement);$il.Emit($op::Conv_R8);ST scalar
+                LD Output64;LD outBase;LD lane;C 8;$il.Emit($op::Mul);$il.Emit($op::Add)
+                $il.Emit($op::Ldc_R8,[double]0.5);LD scalar;$il.Emit($op::Mul)
+                $il.Emit($op::Ldc_R8,[double]1);$il.Emit($op::Ldc_R8,[Math]::Sqrt([double]2/[Math]::PI));LD scalar;$il.Emit($op::Ldc_R8,[double]0.044715)
+                for($k=0;$k -lt 3;$k++){LD scalar;$il.Emit($op::Mul)}
+                $il.Emit($op::Add);$il.Emit($op::Mul);$il.Emit($op::Call,$tanh);$il.Emit($op::Add);$il.Emit($op::Mul);$il.Emit($op::Conv_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Stelem_R8)
+                Inc lane;$il.Emit($op::Br,$ll);$il.MarkLabel($le)
+            }else{
+                LD "s$($TileRows*$group+$row)";$il.Emit($op::Call,$narrow);LD Output;LD r;C $row;$il.Emit($op::Add);if($OutputOffset){LD OutputRowOffset;$il.Emit($op::Add)};LD OutputChannels;$il.Emit($op::Mul);LD ob;$il.Emit($op::Add);C (8*$group);$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$store)
+            }
+        };$il.MarkLabel($skip)
+    }
+    Inc r $TileRows;$il.Emit($op::Br,$rl);$il.MarkLabel($re);Inc b $Groups;$il.Emit($op::Br,$bl);$il.MarkLabel($be);$il.Emit($op::Ret)
+    return $dm
+}
+# Input tiles are K-major: 16 successive token values for each input channel.
+function New-OfflineAlbertInputTilePacker([int]$TileRows=16,[switch]$WideInput) {
+    $outputType=if($WideInput){[double]}else{[float]}
+    $op=[Reflection.Emit.OpCodes]
+    $dm=[Reflection.Emit.DynamicMethod]::new("PackAlbertInput$TileRows",$outputType.MakeArrayType(),[type[]]@([float[]],[int],[int]),$true)
+    $il=$dm.GetILGenerator();$r=$il.DeclareLocal([int]);$k=$il.DeclareLocal([int]);$out=$il.DeclareLocal($outputType.MakeArrayType());$src=$il.DeclareLocal([int]);$dst=$il.DeclareLocal([int]);$rl=$il.DefineLabel();$re=$il.DefineLabel();$kl=$il.DefineLabel();$ke=$il.DefineLabel()
+    $il.Emit($op::Ldarg_1);$il.Emit($op::Ldc_I4,($TileRows-1));$il.Emit($op::Add);if(($TileRows -band ($TileRows-1)) -eq 0){$il.Emit($op::Ldc_I4,(-$TileRows));$il.Emit($op::And);}else{$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Div);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Mul);};$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Newarr,$outputType);$il.Emit($op::Stloc,$out)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$r);$il.MarkLabel($rl);$il.Emit($op::Ldloc,$r);$il.Emit($op::Ldarg_1);$il.Emit($op::Bge,$re)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Stloc,$src)
+    $il.Emit($op::Ldloc,$r);if(($TileRows -band ($TileRows-1)) -eq 0){$il.Emit($op::Ldc_I4,(-$TileRows));$il.Emit($op::And);}else{$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Div);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Mul);};$il.Emit($op::Ldarg_2);$il.Emit($op::Mul);$il.Emit($op::Ldloc,$r);if(($TileRows -band ($TileRows-1)) -eq 0){$il.Emit($op::Ldc_I4,($TileRows-1));$il.Emit($op::And);}else{$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Rem);};$il.Emit($op::Add);$il.Emit($op::Stloc,$dst)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$k);$il.MarkLabel($kl);$il.Emit($op::Ldloc,$k);$il.Emit($op::Ldarg_2);$il.Emit($op::Bge,$ke)
+    $il.Emit($op::Ldloc,$out);$il.Emit($op::Ldloc,$dst);$il.Emit($op::Ldloc,$k);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Mul);$il.Emit($op::Add);$il.Emit($op::Ldarg_0);$il.Emit($op::Ldloc,$src);$il.Emit($op::Ldloc,$k);$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);if($WideInput){$il.Emit($op::Conv_R8);$il.Emit($op::Stelem_R8)}else{$il.Emit($op::Stelem_R4)}
+    $il.Emit($op::Ldloc,$k);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$k);$il.Emit($op::Br,$kl);$il.MarkLabel($ke)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$r);$il.Emit($op::Br,$rl);$il.MarkLabel($re);$il.Emit($op::Ldloc,$out);$il.Emit($op::Ret)
+    if($WideInput){return $dm.CreateDelegate([Func[float[],int,int,double[]]])};return $dm.CreateDelegate([Func[float[],int,int,float[]]])
+}
+$script:OfflineAlbertExpansionMethod=$null;$script:OfflineAlbertExpansionPacker=$null
+$script:OfflineAlbertRegisterMethod=$null;$script:OfflineAlbertRegisterPacker=$null
+$script:OfflineAlbertWideInputMethod=$null;$script:OfflineAlbertWideInputPacker=$null
+$script:OfflineAlbertTiledMethod=$null;$script:OfflineAlbertInputTilePacker=$null
+$script:OfflineAlbertDenseCache=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+$script:OfflineAlbertDensePacker=$null;$script:OfflineAlbertDenseMethod=$null
+function Invoke-OfflineAlbertDense([float[]]$Rows,[int]$RowCount,[int]$Inputs,[float[]]$Weight,[float[]]$Bias,[string]$Prefix,[double[]]$PackedInput64=$null){
+    if($null -eq $script:OfflineAlbertDenseMethod){$script:OfflineAlbertDensePacker=New-OfflineAlbertDensePacker;$script:OfflineAlbertDenseMethod=New-OfflineAlbertDenseMethod}
+    if(!$script:OfflineAlbertDenseCache.ContainsKey($Prefix)){
+        $script:OfflineAlbertDenseCache.Add($Prefix,[Tuple[System.Runtime.Intrinsics.Vector256[float][],System.Runtime.Intrinsics.Vector256[float][]]]::new($script:OfflineAlbertDensePacker.Invoke($Weight,$Bias.Length,$Inputs),$script:OfflineAlbertDensePacker.Invoke($Bias,$Bias.Length,1)))
+    }
+    $packed=$script:OfflineAlbertDenseCache[$Prefix]
+    $blockGroup=1;$padded64=$null
+    if($AlbertExpansionDense -and $AlbertRegisterDense -and $AlbertWideInput -and $Inputs -eq 768 -and $Bias.Length -eq 2048){
+        if($RowCount -lt 1 -or $Rows.Length -ne [long]$RowCount*$Inputs -or $packed.Item1.Length -ne [long]($Bias.Length/8)*$Inputs -or $packed.Item2.Length -ne $Bias.Length/8){throw 'ALBERT expansion shape mismatch'}
+        if($null -eq $script:OfflineAlbertExpansionMethod){$script:OfflineAlbertExpansionMethod=New-OfflineAlbertRegisterMethod -WideInput -TileRows 12 -Groups 2;$script:OfflineAlbertExpansionPacker=New-OfflineAlbertInputTilePacker 12 -WideInput}
+        $padded64=$script:OfflineAlbertExpansionPacker.Invoke($Rows,$RowCount,$Inputs);$padded=$null;$method=$script:OfflineAlbertExpansionMethod;$blockGroup=2
+    }elseif($AlbertRegisterDense -and $Bias.Length%24 -eq 0){
+        if($RowCount -lt 1 -or $Inputs -lt 1 -or $Rows.Length -ne [long]$RowCount*$Inputs -or $packed.Item1.Length -ne [long]($Bias.Length/8)*$Inputs -or $packed.Item2.Length -ne $Bias.Length/8){throw 'ALBERT register shape mismatch'}
+        if($null -eq $script:OfflineAlbertRegisterMethod){$script:OfflineAlbertRegisterMethod=New-OfflineAlbertRegisterMethod;$script:OfflineAlbertRegisterPacker=New-OfflineAlbertInputTilePacker 8}
+        if($AlbertWideInput){
+            if($null -eq $script:OfflineAlbertWideInputMethod){$script:OfflineAlbertWideInputMethod=New-OfflineAlbertRegisterMethod -WideInput;$script:OfflineAlbertWideInputPacker=New-OfflineAlbertInputTilePacker 8 -WideInput}
+            if($null -ne $PackedInput64){
+                if($PackedInput64.Length -ne 8*[int][Math]::Ceiling($RowCount/8.0)*$Inputs){throw 'ALBERT shared input shape mismatch'}
+                $padded64=$PackedInput64
+            }else{$padded64=$script:OfflineAlbertWideInputPacker.Invoke($Rows,$RowCount,$Inputs)}
+            $padded=$null;$method=$script:OfflineAlbertWideInputMethod
+        }else{$padded=$script:OfflineAlbertRegisterPacker.Invoke($Rows,$RowCount,$Inputs);$method=$script:OfflineAlbertRegisterMethod};$blockGroup=3
+    }elseif($AlbertTiledDense){
+        if($RowCount -lt 1 -or $Inputs -lt 1 -or $Rows.Length -ne [long]$RowCount*$Inputs -or $Bias.Length -lt 8 -or $Bias.Length%8 -ne 0 -or $packed.Item1.Length -ne [long]($Bias.Length/8)*$Inputs -or $packed.Item2.Length -ne $Bias.Length/8){throw 'ALBERT tile shape mismatch'}
+        if($null -eq $script:OfflineAlbertTiledMethod){$script:OfflineAlbertTiledMethod=New-OfflineAlbertTiledMethod;$script:OfflineAlbertInputTilePacker=New-OfflineAlbertInputTilePacker}
+        $padded=$script:OfflineAlbertInputTilePacker.Invoke($Rows,$RowCount,$Inputs);$method=$script:OfflineAlbertTiledMethod
+    }else{$padded=[float[]]::new([int]([Math]::Ceiling($RowCount/8.0)*8)*$Inputs);[Array]::Copy($Rows,$padded,$Rows.Length);$method=$script:OfflineAlbertDenseMethod}
+    $values=[float[]]::new($RowCount*$Bias.Length);$blocks=[int]($Bias.Length/(8*$blockGroup));$workers=[Math]::Min($Threads,$blocks);$tasks=[Threading.Tasks.Task[]]::new($workers)
+    for($i=0;$i -lt $workers;$i++){
+        $job=[OfflineAlbertDenseJob]::new();$job.Input=$padded;$job.Input64=$padded64;$job.Packed=$packed.Item1;$job.Bias=$packed.Item2;$job.Output=$values;$job.Rows=$RowCount;$job.InputChannels=$Inputs;$job.OutputChannels=$Bias.Length
+        $job.FirstBlock=$blockGroup*[int][Math]::Floor($i*$blocks/[double]$workers);$job.LastBlock=$blockGroup*[int][Math]::Floor(($i+1)*$blocks/[double]$workers)
+        $tasks[$i]=[Threading.Tasks.Task]::Run($method.CreateDelegate([Action],$job))
+    }
+    [Threading.Tasks.Task]::WaitAll($tasks);return ,$values
+}
+
+function Invoke-OfflineLinear([float[]] $Rows, [int] $rowCount, [string] $Prefix,[double[]]$PackedInput64=$null) {
     $stageWatch = [Diagnostics.Stopwatch]::StartNew()
     $weight = Read-OfflineWeight ($Prefix + '.weight'); $bias = Read-OfflineWeight ($Prefix + '.bias')
     $inputs = [int]($weight.Length / $bias.Length); $cacheKey = $Prefix
@@ -2260,7 +2721,9 @@ function Invoke-OfflineLinear([float[]] $Rows, [int] $rowCount, [string] $Prefix
         }
         $weight = $script:OfflineFormatWeights[$cacheKey]
     }
-    if ($Dense -eq 'Scalar') {
+    if ($AlbertWideDense -and $Dense -eq 'Vector' -and $null -eq $script:OfflineAlbertFormat -and $Prefix.StartsWith('bert.module.',[StringComparison]::Ordinal) -and $bias.Length % 8 -eq 0 -and [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported) {
+        $values = Invoke-OfflineAlbertDense $Rows $rowCount $inputs $weight $bias $Prefix $PackedInput64
+    } elseif ($Dense -eq 'Scalar') {
         $values = $upstreamMath::Linear($Rows, $rowCount, $inputs, $weight, $bias, $bias.Length)
     } else {
         if ($Rows.Length -ne $rowCount * $inputs -or $rowCount -lt 1) { throw 'Dense input shape mismatch.' }
@@ -2294,6 +2757,250 @@ function Invoke-OfflineLinear([float[]] $Rows, [int] $rowCount, [string] $Prefix
     }
     return , $values
 }
+# Each SIMD lane is a different key token (QK) or output channel (AV).
+# Neither reduction changes its original sequence of FP64 operations.
+class OfflineAlbertAttentionJob {
+    [float[]] $Query
+    [float[]] $Key
+    [float[]] $Value
+    [float[]] $Context
+    [double[]] $Attention
+    [int] $Rows
+    [int] $FirstHead
+    [int] $LastHead
+}
+function New-OfflineAlbertAttentionMethod([switch]$Blocked) {
+    $v=[System.Runtime.Intrinsics.Vector512[double]];$vt=[System.Runtime.Intrinsics.Vector512];$w=[System.Runtime.Intrinsics.Vector256[float]];$wt=[System.Runtime.Intrinsics.Vector256];$op=[Reflection.Emit.OpCodes];$job=[OfflineAlbertAttentionJob];$avx=[System.Runtime.Intrinsics.X86.Avx512F]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactAlbertAttention',[void],[type[]]@($job),$job,$true);$il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'h','offset','i','j','d','b','lane','blocks','pad','qbase','kbase','vbase','at'){$loc.Add($n,$il.DeclareLocal([int]))}
+    $loc.Add('packed',$il.DeclareLocal([float[]]));$loc.Add('scores',$il.DeclareLocal([double[]]));foreach($n in 'max','total','score'){$loc.Add($n,$il.DeclareLocal([double]))};foreach($n in 'sum','scale'){$loc.Add($n,$il.DeclareLocal($v))}
+    if($Blocked){foreach($n in 'queryValue','scoreValue','sum1','sum2','sum3','sum4','sum5','sum6','sum7'){$loc.Add($n,$il.DeclareLocal($v))}}
+    $fma=$avx.GetMethod('FusedMultiplyAdd',[type[]]@($v,$v,$v))
+    $create=$vt.GetMethod('Create',[type[]]@([double]));$widen=$avx.GetMethod('ConvertToVector512Double',[type[]]@($w));$narrow=$avx.GetMethod('ConvertToVector256Single',[type[]]@($v))
+    $add=($vt.GetMethods()|Where-Object {$_.Name -eq 'Add' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double]);$mul=($vt.GetMethods()|Where-Object {$_.Name -eq 'Multiply' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[0].ParameterType.IsGenericType -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double]);$div=($vt.GetMethods()|Where-Object {$_.Name -eq 'Divide' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Length -eq 2 -and $_.GetParameters()[1].ParameterType.IsGenericType})[0].MakeGenericMethod([double])
+    $load=($wt.GetMethods()|Where-Object {$_.Name -eq 'LoadUnsafe' -and $_.GetParameters().Length -eq 1})[0].MakeGenericMethod([float]);$store=($wt.GetMethods()|Where-Object {$_.Name -eq 'StoreUnsafe' -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([float]);$storeD=($vt.GetMethods()|Where-Object {$_.Name -eq 'StoreUnsafe' -and $_.GetParameters().Length -eq 2})[0].MakeGenericMethod([double]);$exp=[Math].GetMethod('Exp',[type[]]@([double]))
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function EmitDouble([double]$n){$il.Emit($op::Ldc_R8,$n)};function Inc([string]$n,[int]$step=1){LD $n;C $step;$il.Emit($op::Add);ST $n}
+    # Emit bounded loops; the scriptblock runs only while constructing IL.
+    function Loop([string]$n,[string]$bound,[int]$step,[scriptblock]$body){C 0;ST $n;$l=$il.DefineLabel();$e=$il.DefineLabel();$il.MarkLabel($l);LD $n;LD $bound;$il.Emit($op::Bge,$e);& $body;Inc $n $step;$il.Emit($op::Br,$l);$il.MarkLabel($e)}
+    LD Rows;if($Blocked){C 31;$il.Emit($op::Add);C 32;$il.Emit($op::Div);C 4;$il.Emit($op::Mul)}else{C 7;$il.Emit($op::Add);C 8;$il.Emit($op::Div)};ST blocks;LD blocks;C 8;$il.Emit($op::Mul);ST pad
+    LD pad;C 64;$il.Emit($op::Mul);$il.Emit($op::Newarr,[float]);ST packed;LD pad;$il.Emit($op::Newarr,[double]);ST scores
+    EmitDouble 0.125;$il.Emit($op::Call,$create);ST scale
+    LD FirstHead;ST h;$hl=$il.DefineLabel();$he=$il.DefineLabel();$il.MarkLabel($hl);LD h;LD LastHead;$il.Emit($op::Bge,$he);LD h;C 64;$il.Emit($op::Mul);ST offset
+    # Pack K into [keyBlock, dimension, lane]; zero-padded last block never enters softmax.
+    Loop j Rows 1 {
+        LD j;C 768;$il.Emit($op::Mul);LD offset;$il.Emit($op::Add);ST kbase
+        C 0;ST d;$dl=$il.DefineLabel();$de=$il.DefineLabel();$il.MarkLabel($dl);LD d;C 64;$il.Emit($op::Bge,$de)
+        LD packed;LD j;C 8;$il.Emit($op::Div);C 512;$il.Emit($op::Mul);LD d;C 8;$il.Emit($op::Mul);$il.Emit($op::Add);LD j;C 7;$il.Emit($op::And);$il.Emit($op::Add)
+        LD Key;LD kbase;LD d;$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);$il.Emit($op::Stelem_R4)
+        Inc d;$il.Emit($op::Br,$dl);$il.MarkLabel($de)
+    }
+    Loop i Rows 1 {
+        LD i;C 768;$il.Emit($op::Mul);LD offset;$il.Emit($op::Add);ST qbase
+        if($Blocked){
+            # Four key blocks share each query broadcast. FP32 products are exact in FP64.
+            Loop b blocks 4 {
+                EmitDouble 0;$il.Emit($op::Call,$create);ST sum;LD sum;ST sum1;LD sum;ST sum2;LD sum;ST sum3
+                LD b;C 512;$il.Emit($op::Mul);ST kbase
+                C 0;ST d;$dl=$il.DefineLabel();$de=$il.DefineLabel();$il.MarkLabel($dl);LD d;C 64;$il.Emit($op::Bge,$de)
+                LD Query;LD qbase;LD d;$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Call,$create);ST queryValue
+                for($g=0;$g -lt 4;$g++){
+                    $acc=if($g -eq 0){'sum'}else{"sum$g"}
+                    LD packed;LD kbase;LD d;C 8;$il.Emit($op::Mul);$il.Emit($op::Add);if($g){C (512*$g);$il.Emit($op::Add)};$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$load);$il.Emit($op::Call,$widen)
+                    LD queryValue;LD $acc;$il.Emit($op::Call,$fma);ST $acc
+                }
+                Inc d;$il.Emit($op::Br,$dl);$il.MarkLabel($de)
+                for($g=0;$g -lt 4;$g++){$acc=if($g -eq 0){'sum'}else{"sum$g"};LD $acc;LD scale;$il.Emit($op::Call,$mul);LD scores;LD b;C 8;$il.Emit($op::Mul);if($g){C (8*$g);$il.Emit($op::Add)};$il.Emit($op::Ldelema,[double]);$il.Emit($op::Call,$storeD)}
+            }
+        }else{
+        Loop b blocks 1 {
+            EmitDouble 0;$il.Emit($op::Call,$create);ST sum;LD b;C 512;$il.Emit($op::Mul);ST kbase
+            C 0;ST d;$dl=$il.DefineLabel();$de=$il.DefineLabel();$il.MarkLabel($dl);LD d;C 64;$il.Emit($op::Bge,$de)
+            LD sum;LD packed;LD kbase;LD d;C 8;$il.Emit($op::Mul);$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$load);$il.Emit($op::Call,$widen)
+            LD Query;LD qbase;LD d;$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Call,$create);$il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST sum
+            Inc d;$il.Emit($op::Br,$dl);$il.MarkLabel($de)
+            LD sum;LD scale;$il.Emit($op::Call,$mul);LD scores;LD b;C 8;$il.Emit($op::Mul);$il.Emit($op::Ldelema,[double]);$il.Emit($op::Call,$storeD)
+        }
+        }
+        EmitDouble ([double]::NegativeInfinity);ST max
+        Loop j Rows 1 {LD scores;LD j;$il.Emit($op::Ldelem_R8);ST score;LD score;LD max;$skip=$il.DefineLabel();$il.Emit($op::Ble,$skip);LD score;ST max;$il.MarkLabel($skip)}
+        EmitDouble 0;ST total
+        Loop j Rows 1 {LD scores;LD j;$il.Emit($op::Ldelem_R8);LD max;$il.Emit($op::Sub);$il.Emit($op::Call,$exp);ST score;LD scores;LD j;LD score;$il.Emit($op::Stelem_R8);LD total;LD score;$il.Emit($op::Add);ST total}
+        $noTrace=$il.DefineLabel();LD Attention;$il.Emit($op::Brfalse,$noTrace)
+        Loop j Rows 1 {LD Attention;LD h;LD Rows;$il.Emit($op::Mul);LD i;$il.Emit($op::Add);LD Rows;$il.Emit($op::Mul);LD j;$il.Emit($op::Add);LD scores;LD j;$il.Emit($op::Ldelem_R8);LD total;$il.Emit($op::Div);$il.Emit($op::Stelem_R8)}
+        $il.MarkLabel($noTrace)
+        if($Blocked){
+            # All 64 context channels share the same key traversal and score broadcast.
+            EmitDouble 0;$il.Emit($op::Call,$create);ST sum;for($g=1;$g -lt 8;$g++){LD sum;ST "sum$g"}
+            Loop j Rows 1 {
+                LD j;C 768;$il.Emit($op::Mul);LD offset;$il.Emit($op::Add);ST vbase
+                LD scores;LD j;$il.Emit($op::Ldelem_R8);$il.Emit($op::Call,$create);ST scoreValue
+                for($g=0;$g -lt 8;$g++){
+                    $acc=if($g -eq 0){'sum'}else{"sum$g"};LD $acc;LD Value;LD vbase;if($g){C (8*$g);$il.Emit($op::Add)};$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$load);$il.Emit($op::Call,$widen);LD scoreValue;$il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST $acc
+                }
+            }
+            LD total;$il.Emit($op::Call,$create);ST scoreValue
+            for($g=0;$g -lt 8;$g++){$acc=if($g -eq 0){'sum'}else{"sum$g"};LD $acc;LD scoreValue;$il.Emit($op::Call,$div);$il.Emit($op::Call,$narrow);LD Context;LD qbase;if($g){C (8*$g);$il.Emit($op::Add)};$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$store)}
+        }else{
+        C 0;ST d;$cl=$il.DefineLabel();$ce=$il.DefineLabel();$il.MarkLabel($cl);LD d;C 64;$il.Emit($op::Bge,$ce);EmitDouble 0;$il.Emit($op::Call,$create);ST sum
+        Loop j Rows 1 {LD sum;LD Value;LD j;C 768;$il.Emit($op::Mul);LD offset;$il.Emit($op::Add);LD d;$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$load);$il.Emit($op::Call,$widen);LD scores;LD j;$il.Emit($op::Ldelem_R8);$il.Emit($op::Call,$create);$il.Emit($op::Call,$mul);$il.Emit($op::Call,$add);ST sum}
+        LD sum;LD total;$il.Emit($op::Call,$create);$il.Emit($op::Call,$div);$il.Emit($op::Call,$narrow);LD Context;LD qbase;LD d;$il.Emit($op::Add);$il.Emit($op::Ldelema,[float]);$il.Emit($op::Call,$store)
+        Inc d 8;$il.Emit($op::Br,$cl);$il.MarkLabel($ce)
+        }
+    }
+    Inc h;$il.Emit($op::Br,$hl);$il.MarkLabel($he);$il.Emit($op::Ret);return $dm
+}
+$script:OfflineAlbertAttentionMethod=$null
+$script:OfflineAlbertBlockedAttentionMethod=$null
+function Invoke-OfflineAlbertAttention([float[]]$Query,[float[]]$Key,[float[]]$Value,[int]$Rows,[double[]]$Attention){
+    if($null -eq $script:OfflineAlbertAttentionMethod){$script:OfflineAlbertAttentionMethod=New-OfflineAlbertAttentionMethod}
+    $method=$script:OfflineAlbertAttentionMethod
+    if($AlbertBlockedAttention){if($null -eq $script:OfflineAlbertBlockedAttentionMethod){$script:OfflineAlbertBlockedAttentionMethod=New-OfflineAlbertAttentionMethod -Blocked};$method=$script:OfflineAlbertBlockedAttentionMethod}
+    $context=[float[]]::new($Rows*768);$count=[Math]::Min($Threads,12);$tasks=[Threading.Tasks.Task[]]::new($count)
+    for($i=0;$i -lt $count;$i++){$job=[OfflineAlbertAttentionJob]::new();$job.Query=$Query;$job.Key=$Key;$job.Value=$Value;$job.Context=$context;$job.Attention=$Attention;$job.Rows=$Rows;$job.FirstHead=[int][Math]::Floor(12*$i/[double]$count);$job.LastHead=[int][Math]::Floor(12*($i+1)/[double]$count);$tasks[$i]=[Threading.Tasks.Task]::Run($method.CreateDelegate([Action],$job))}
+    [Threading.Tasks.Task]::WaitAll($tasks);return ,$context
+}
+
+# Elementwise GELU is independent across coordinates. Preserve the scalar evaluation order.
+class OfflineAlbertGeluJob {
+    [float[]] $Input
+    [float[]] $Output
+    [int] $First
+    [int] $Last
+}
+function New-OfflineAlbertGeluMethod {
+    $job=[OfflineAlbertGeluJob];$op=[Reflection.Emit.OpCodes]
+    $dm=[Reflection.Emit.DynamicMethod]::new('ExactAlbertGelu',[void],[type[]]@($job),$job,$true);$il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    $i=$il.DeclareLocal([int]);$v=$il.DeclareLocal([double]);$loop=$il.DefineLabel();$end=$il.DefineLabel()
+    $il.Emit($op::Ldloc,$loc['First']);$il.Emit($op::Stloc,$i);$il.MarkLabel($loop);$il.Emit($op::Ldloc,$i);$il.Emit($op::Ldloc,$loc['Last']);$il.Emit($op::Bge,$end)
+    $il.Emit($op::Ldloc,$loc['Input']);$il.Emit($op::Ldloc,$i);$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Stloc,$v)
+    $il.Emit($op::Ldloc,$loc['Output']);$il.Emit($op::Ldloc,$i)
+    $il.Emit($op::Ldc_R8,[double]0.5);$il.Emit($op::Ldloc,$v);$il.Emit($op::Mul)
+    $il.Emit($op::Ldc_R8,[double]1);$il.Emit($op::Ldc_R8,[Math]::Sqrt([double]2/[Math]::PI));$il.Emit($op::Ldloc,$v);$il.Emit($op::Ldc_R8,[double]0.044715)
+    for($k=0;$k -lt 3;$k++){$il.Emit($op::Ldloc,$v);$il.Emit($op::Mul)}
+    $il.Emit($op::Add);$il.Emit($op::Mul);$il.Emit($op::Call,[Math].GetMethod('Tanh',[type[]]@([double])));$il.Emit($op::Add);$il.Emit($op::Mul);$il.Emit($op::Conv_R4);$il.Emit($op::Stelem_R4)
+    $il.Emit($op::Ldloc,$i);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$i);$il.Emit($op::Br,$loop);$il.MarkLabel($end);$il.Emit($op::Ret);return $dm
+}
+$script:OfflineAlbertGeluMethod=$null
+function Invoke-OfflineAlbertGelu([float[]]$InputValues){
+    if($null -eq $script:OfflineAlbertGeluMethod){$script:OfflineAlbertGeluMethod=New-OfflineAlbertGeluMethod}
+    $output=[float[]]::new($InputValues.Length);$count=[Math]::Min($Threads,[Math]::Max(1,[int][Math]::Ceiling($InputValues.Length/32768.0)));$tasks=[Threading.Tasks.Task[]]::new($count)
+    for($i=0;$i -lt $count;$i++){$job=[OfflineAlbertGeluJob]::new();$job.Input=$InputValues;$job.Output=$output;$job.First=[int][Math]::Floor($i*[double]$InputValues.Length/$count);$job.Last=[int][Math]::Floor(($i+1)*[double]$InputValues.Length/$count);$tasks[$i]=[Threading.Tasks.Task]::Run($script:OfflineAlbertGeluMethod.CreateDelegate([Action],$job))}
+    [Threading.Tasks.Task]::WaitAll($tasks);return ,$output
+}
+
+# ALBERT feed-forward pipeline: a token tile owns its expansion, activation and contraction.
+# The expansion never exists as a row-major array. Its GELU epilogue emits the contraction layout.
+class OfflineAlbertFfnJob {
+    [float[]] $Input
+    [int] $First
+    [int] $Last
+    [int] $TileRows
+    [OfflineAlbertDenseJob] $Expand
+    [OfflineAlbertDenseJob] $Contract
+    [Action[float[],int,int,double[]]] $Pack
+    [Action[OfflineAlbertDenseJob]] $ExpandRun
+    [Action[OfflineAlbertDenseJob]] $ContractRun
+}
+function New-OfflineAlbertFfnSlicePack([int]$TileRows=12) {
+    $op=[Reflection.Emit.OpCodes];$dm=[Reflection.Emit.DynamicMethod]::new('PackAlbertFfnSlice',[void],[type[]]@([float[]],[int],[int],[double[]]),$true);$il=$dm.GetILGenerator()
+    $r=$il.DeclareLocal([int]);$k=$il.DeclareLocal([int]);$src=$il.DeclareLocal([int]);$dst=$il.DeclareLocal([int]);$rl=$il.DefineLabel();$re=$il.DefineLabel();$kl=$il.DefineLabel();$ke=$il.DefineLabel()
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$r);$il.MarkLabel($rl);$il.Emit($op::Ldloc,$r);$il.Emit($op::Ldarg_2);$il.Emit($op::Bge,$re)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldarg_1);$il.Emit($op::Add);$il.Emit($op::Ldc_I4,768);$il.Emit($op::Mul);$il.Emit($op::Stloc,$src)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Div);$il.Emit($op::Ldc_I4,(768*$TileRows));$il.Emit($op::Mul);$il.Emit($op::Ldloc,$r);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Rem);$il.Emit($op::Add);$il.Emit($op::Stloc,$dst)
+    $il.Emit($op::Ldc_I4_0);$il.Emit($op::Stloc,$k);$il.MarkLabel($kl);$il.Emit($op::Ldloc,$k);$il.Emit($op::Ldc_I4,768);$il.Emit($op::Bge,$ke)
+    $il.Emit($op::Ldarg_3);$il.Emit($op::Ldloc,$dst);$il.Emit($op::Ldloc,$k);$il.Emit($op::Ldc_I4,$TileRows);$il.Emit($op::Mul);$il.Emit($op::Add);$il.Emit($op::Ldarg_0);$il.Emit($op::Ldloc,$src);$il.Emit($op::Ldloc,$k);$il.Emit($op::Add);$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Stelem_R8)
+    $il.Emit($op::Ldloc,$k);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$k);$il.Emit($op::Br,$kl);$il.MarkLabel($ke)
+    $il.Emit($op::Ldloc,$r);$il.Emit($op::Ldc_I4_1);$il.Emit($op::Add);$il.Emit($op::Stloc,$r);$il.Emit($op::Br,$rl);$il.MarkLabel($re);$il.Emit($op::Ret)
+    return $dm.CreateDelegate([Action[float[],int,int,double[]]])
+}
+function New-OfflineAlbertFfnWorker {
+    $op=[Reflection.Emit.OpCodes];$job=[OfflineAlbertFfnJob];$dense=[OfflineAlbertDenseJob]
+    $dm=[Reflection.Emit.DynamicMethod]::new('AlbertFfnTileWorker',[void],[type[]]@($job),$job,$true);$il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($p in $job.GetProperties()){$loc.Add($p.Name,$il.DeclareLocal($p.PropertyType));$il.Emit($op::Ldarg_0);$il.Emit($op::Callvirt,$p.GetMethod);$il.Emit($op::Stloc,$loc[$p.Name])}
+    foreach($n in 'at','rows'){$loc.Add($n,$il.DeclareLocal([int]))}
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])}
+    $loop=$il.DefineLabel();$end=$il.DefineLabel();LD First;ST at;$il.MarkLabel($loop);LD at;LD Last;$il.Emit($op::Bge,$end)
+    LD Last;LD at;$il.Emit($op::Sub);LD TileRows;$il.Emit($op::Call,[Math].GetMethod('Min',[type[]]@([int],[int])));ST rows
+    LD Pack;LD Input;LD at;LD rows;LD Expand;$il.Emit($op::Callvirt,$dense.GetProperty('Input64').GetMethod);$il.Emit($op::Callvirt,[Action[float[],int,int,double[]]].GetMethod('Invoke'))
+    LD Expand;LD rows;$il.Emit($op::Callvirt,$dense.GetProperty('Rows').SetMethod)
+    LD Contract;LD rows;$il.Emit($op::Callvirt,$dense.GetProperty('Rows').SetMethod)
+    LD Contract;LD at;$il.Emit($op::Callvirt,$dense.GetProperty('OutputRowOffset').SetMethod)
+    LD ExpandRun;LD Expand;$il.Emit($op::Callvirt,[Action[OfflineAlbertDenseJob]].GetMethod('Invoke'))
+    LD ContractRun;LD Contract;$il.Emit($op::Callvirt,[Action[OfflineAlbertDenseJob]].GetMethod('Invoke'))
+    LD at;LD rows;$il.Emit($op::Add);ST at;$il.Emit($op::Br,$loop);$il.MarkLabel($end);$il.Emit($op::Ret);return $dm
+}
+$script:OfflineAlbertSharedPack=$null;$script:OfflineAlbertFfnExpand=$null;$script:OfflineAlbertFfnContract=$null;$script:OfflineAlbertFfnWorker=$null;$script:OfflineAlbertFfnPack=$null
+class OfflineAlbertFfnWorkspace {
+    [OfflineAlbertFfnJob[]] $Jobs
+}
+function Invoke-OfflineAlbertFusedFfn([float[]]$InputValues,[int]$Rows,[string]$Layer,[OfflineAlbertFfnWorkspace]$Workspace){
+    if($Rows -lt 1 -or $InputValues.Length -ne 768*$Rows -or $AlbertFfnTileRows%12 -ne 0){throw 'ALBERT FFN tile shape mismatch'}
+    if($null -eq $script:OfflineAlbertDensePacker){$script:OfflineAlbertDensePacker=New-OfflineAlbertDensePacker;$script:OfflineAlbertDenseMethod=New-OfflineAlbertDenseMethod}
+    foreach($name in 'ffn','ffn_output'){
+        $prefix=$Layer+$name
+        if(!$script:OfflineAlbertDenseCache.ContainsKey($prefix)){
+            $w=Read-OfflineWeight ($prefix+'.weight');$b=Read-OfflineWeight ($prefix+'.bias');$k=if($name -eq 'ffn'){768}else{2048};$n=if($name -eq 'ffn'){2048}else{768}
+            if($w.Length -ne $k*$n -or $b.Length -ne $n){throw 'ALBERT FFN weight shape mismatch'}
+            $script:OfflineAlbertDenseCache.Add($prefix,[Tuple[System.Runtime.Intrinsics.Vector256[float][],System.Runtime.Intrinsics.Vector256[float][]]]::new($script:OfflineAlbertDensePacker.Invoke($w,$n,$k),$script:OfflineAlbertDensePacker.Invoke($b,$n,1)))
+        }
+    }
+    $a=$script:OfflineAlbertDenseCache[$Layer+'ffn'];$b=$script:OfflineAlbertDenseCache[$Layer+'ffn_output']
+    if($a.Item1.Length -ne 256*768 -or $a.Item2.Length -ne 256 -or $b.Item1.Length -ne 96*2048 -or $b.Item2.Length -ne 96){throw 'ALBERT FFN packed shape mismatch'}
+    if($null -eq $script:OfflineAlbertFfnWorker){
+        $script:OfflineAlbertFfnExpand=(New-OfflineAlbertRegisterMethod -WideInput -TileRows 12 -Groups 2 -GeluPackedOutput).CreateDelegate([Action[OfflineAlbertDenseJob]])
+        $script:OfflineAlbertFfnContract=(New-OfflineAlbertRegisterMethod -WideInput -OutputOffset).CreateDelegate([Action[OfflineAlbertDenseJob]])
+        $script:OfflineAlbertFfnPack=New-OfflineAlbertFfnSlicePack;$script:OfflineAlbertFfnWorker=New-OfflineAlbertFfnWorker
+    }
+    $output=[float[]]::new($Rows*768);$tiles=[int][Math]::Ceiling($Rows/[double]$AlbertFfnTileRows);$count=[Math]::Min($Threads,$tiles);$tasks=[Threading.Tasks.Task[]]::new($count)
+    if($null -eq $Workspace.Jobs){
+        $Workspace.Jobs=[OfflineAlbertFfnJob[]]::new($count)
+    for($i=0;$i -lt $count;$i++){
+        $job=[OfflineAlbertFfnJob]::new();$job.First=$AlbertFfnTileRows*[int][Math]::Floor($i*$tiles/[double]$count);$job.Last=[Math]::Min($Rows,$AlbertFfnTileRows*[int][Math]::Floor(($i+1)*$tiles/[double]$count));$job.TileRows=$AlbertFfnTileRows
+        $capacity=[Math]::Min($AlbertFfnTileRows,$job.Last-$job.First);$expand=[OfflineAlbertDenseJob]::new();$contract=[OfflineAlbertDenseJob]::new()
+        $expand.Input64=[double[]]::new(12*[int][Math]::Ceiling($capacity/12.0)*768);$expand.Output64=[double[]]::new(8*[int][Math]::Ceiling($capacity/8.0)*2048);$expand.Packed=$a.Item1;$expand.Bias=$a.Item2;$expand.InputChannels=768;$expand.OutputChannels=2048;$expand.FirstBlock=0;$expand.LastBlock=256
+        $contract.Input64=$expand.Output64;$contract.Packed=$b.Item1;$contract.Bias=$b.Item2;$contract.InputChannels=2048;$contract.OutputChannels=768;$contract.FirstBlock=0;$contract.LastBlock=96
+        $job.Expand=$expand;$job.Contract=$contract;$job.Pack=$script:OfflineAlbertFfnPack;$job.ExpandRun=$script:OfflineAlbertFfnExpand;$job.ContractRun=$script:OfflineAlbertFfnContract
+        $Workspace.Jobs[$i]=$job
+    }
+    }
+    for($i=0;$i -lt $count;$i++){
+        $job=$Workspace.Jobs[$i];$job.Input=$InputValues;$job.Contract.Output=$output
+        $tasks[$i]=[Threading.Tasks.Task]::Run($script:OfflineAlbertFfnWorker.CreateDelegate([Action],$job))
+    }
+    [Threading.Tasks.Task]::WaitAll($tasks)
+    foreach($job in $Workspace.Jobs){$job.Input=$null;$job.Contract.Output=$null}
+    return ,$output
+}
+
+function New-OfflineAlbertResidualNorm {
+    $op=[Reflection.Emit.OpCodes];$dm=[Reflection.Emit.DynamicMethod]::new('AlbertResidualNormInPlace',[void],[type[]]@([float[]],[float[]],[int],[float[]],[float[]]),$true);$il=$dm.GetILGenerator();$loc=[Collections.Generic.Dictionary[string,Reflection.Emit.LocalBuilder]]::new()
+    foreach($n in 'r','c','at','idx'){$loc.Add($n,$il.DeclareLocal([int]))};foreach($n in 'mean','var','delta','inv'){$loc.Add($n,$il.DeclareLocal([double]))};$loc.Add('rounded',$il.DeclareLocal([float]))
+    function LD([string]$n){$il.Emit($op::Ldloc,$loc[$n])};function ST([string]$n){$il.Emit($op::Stloc,$loc[$n])};function C([int]$n){$il.Emit($op::Ldc_I4,$n)};function D([double]$n){$il.Emit($op::Ldc_R8,$n)};function Inc([string]$n){LD $n;C 1;$il.Emit($op::Add);ST $n}
+    function Channels([scriptblock]$body){C 0;ST c;$loop=$il.DefineLabel();$end=$il.DefineLabel();$il.MarkLabel($loop);LD c;C 768;$il.Emit($op::Bge,$end);LD at;LD c;$il.Emit($op::Add);ST idx;& $body;Inc c;$il.Emit($op::Br,$loop);$il.MarkLabel($end)}
+    $rl=$il.DefineLabel();$re=$il.DefineLabel();C 0;ST r;$il.MarkLabel($rl);LD r;$il.Emit($op::Ldarg_2);$il.Emit($op::Bge,$re);LD r;C 768;$il.Emit($op::Mul);ST at;D 0;ST mean;D 0;ST var
+    Channels {
+        $il.Emit($op::Ldarg_0);LD idx;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Ldarg_1);LD idx;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Add);$il.Emit($op::Conv_R4);ST rounded
+        $il.Emit($op::Ldarg_0);LD idx;LD rounded;$il.Emit($op::Stelem_R4);LD mean;LD rounded;$il.Emit($op::Conv_R8);$il.Emit($op::Add);ST mean
+    }
+    LD mean;D 768;$il.Emit($op::Div);ST mean
+    Channels {$il.Emit($op::Ldarg_0);LD idx;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);LD mean;$il.Emit($op::Sub);ST delta;LD var;LD delta;LD delta;$il.Emit($op::Mul);$il.Emit($op::Add);ST var}
+    D 1;LD var;D 768;$il.Emit($op::Div);D 1e-12;$il.Emit($op::Add);$il.Emit($op::Call,[Math].GetMethod('Sqrt',[type[]]@([double])));$il.Emit($op::Div);ST inv
+    Channels {
+        $il.Emit($op::Ldarg_0);LD idx;$il.Emit($op::Ldarg_0);LD idx;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);LD mean;$il.Emit($op::Sub);LD inv;$il.Emit($op::Mul)
+        $il.Emit($op::Ldarg_3);LD c;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Mul);$il.Emit($op::Ldarg_S,[byte]4);LD c;$il.Emit($op::Ldelem_R4);$il.Emit($op::Conv_R8);$il.Emit($op::Add);$il.Emit($op::Conv_R4);$il.Emit($op::Stelem_R4)
+    }
+    Inc r;$il.Emit($op::Br,$rl);$il.MarkLabel($re);$il.Emit($op::Ret);return $dm.CreateDelegate([Action[float[],float[],int,float[],float[]]])
+}
+$script:OfflineAlbertResidualNorm=$null
+function Invoke-OfflineAlbertResidualNorm([float[]]$Projection,[float[]]$Residual,[int]$Rows,[string]$Prefix){
+    $gamma=Read-OfflineWeight ($Prefix+'.weight');$beta=Read-OfflineWeight ($Prefix+'.bias')
+    if($Projection.Length -ne 768*$Rows -or $Residual.Length -ne $Projection.Length -or [object]::ReferenceEquals($Projection,$Residual) -or $gamma.Length -ne 768 -or $beta.Length -ne 768){throw 'ALBERT residual norm shape mismatch'}
+    if($null -eq $script:OfflineAlbertResidualNorm){$script:OfflineAlbertResidualNorm=New-OfflineAlbertResidualNorm}
+    $script:OfflineAlbertResidualNorm.Invoke($Projection,$Residual,$Rows,$gamma,$beta)
+}
+
 function Invoke-OfflineAlbert([int[]] $Ids) {
     # transformers AlbertModel as used by stock CustomAlbert: one shared layer applied 12 times.
     $p = 'bert.module.'; $layer = $p + 'encoder.albert_layer_groups.0.albert_layers.0.'; $t = $Ids.Length
@@ -2303,14 +3010,24 @@ function Invoke-OfflineAlbert([int[]] $Ids) {
     $x = $upstreamMath::LayerNorm($x, $t, 128, (Read-OfflineWeight ($p + 'embeddings.LayerNorm.weight')), (Read-OfflineWeight ($p + 'embeddings.LayerNorm.bias')), [double]1e-12)
     $h = Invoke-OfflineLinear $x $t ($p + 'encoder.embedding_hidden_mapping_in')
     if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke('albert.embedding_normalized', 'token,channel', $t, $x) }
+    $useFusedFfn=($AlbertFusedFfn -and $AlbertWideDense -and $AlbertRegisterDense -and $AlbertWideInput -and $AlbertExpansionDense -and $Dense -eq 'Vector' -and $null -eq $script:OfflineTensorSink -and $null -eq $script:OfflineAlbertFormat -and [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported)
+    $ffnWorkspace=$null;$sharedPacked=$null
+    if($useFusedFfn){
+        $ffnWorkspace=[OfflineAlbertFfnWorkspace]::new();$sharedPacked=[double[]]::new(8*[int][Math]::Ceiling($t/8.0)*768)
+        if($null -eq $script:OfflineAlbertSharedPack){$script:OfflineAlbertSharedPack=New-OfflineAlbertFfnSlicePack 8}
+    }
     for ($repeat = 0; $repeat -lt 12; $repeat++) {
         $script:OfflineAlbertRepeat = $repeat
-        $query = Invoke-OfflineLinear $h $t ($layer + 'attention.query')
-        $key = Invoke-OfflineLinear $h $t ($layer + 'attention.key')
-        $value = Invoke-OfflineLinear $h $t ($layer + 'attention.value')
+        if($useFusedFfn){$script:OfflineAlbertSharedPack.Invoke($h,0,$t,$sharedPacked)}
+        $query = Invoke-OfflineLinear $h $t ($layer + 'attention.query') $sharedPacked
+        $key = Invoke-OfflineLinear $h $t ($layer + 'attention.key') $sharedPacked
+        $value = Invoke-OfflineLinear $h $t ($layer + 'attention.value') $sharedPacked
+        $attentionWatch=[Diagnostics.Stopwatch]::StartNew()
         $attentionWeights = $null
         if ($null -ne $script:OfflineTensorSink) { $attentionWeights = [double[]]::new(12 * $t * $t) }
-        if ($null -eq $attentionWorker -or $t -lt 32 -or $Dense -eq 'Scalar') {
+        if ($AlbertWideAttention -and $Dense -eq 'Vector' -and [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported) {
+            $context = Invoke-OfflineAlbertAttention $query $key $value $t $attentionWeights
+        } elseif ($null -eq $attentionWorker -or $t -lt 32 -or $Dense -eq 'Scalar') {
             $context = $upstreamMath::SelfAttention($query, $key, $value, $t, 12, 768, $attentionWeights)
         } else {
             $context = [float[]]::new($t * 768)
@@ -2326,21 +3043,41 @@ function Invoke-OfflineAlbert([int[]] $Ids) {
             }
             [Threading.Tasks.Task]::WaitAll($tasks)
         }
+        if($useFusedFfn){$query=$null;$key=$null;$value=$null}
+        $profile.Add([pscustomobject]@{ Stage="albert.$repeat.attention"; Kind='Attention'; Milliseconds=$attentionWatch.Elapsed.TotalMilliseconds; Frames=$t })
         if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.attention.weights", 'head,queryToken,keyToken', $t, $attentionWeights) }
-        $projected = Invoke-OfflineLinear $context $t ($layer + 'attention.dense')
+        if($useFusedFfn){$script:OfflineAlbertSharedPack.Invoke($context,0,$t,$sharedPacked)}
+        $projected = Invoke-OfflineLinear $context $t ($layer + 'attention.dense') $sharedPacked
     if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.attention.context", 'token,channel', $t, $context) }
+        if($useFusedFfn){
+            $context=$null
+            Invoke-OfflineAlbertResidualNorm $projected $h $t ($layer+'attention.LayerNorm');$attention=$projected
+        }else{
         $attentionResidual = $upstreamMath::Add($h, $projected)
         if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.attention.pre_norm",'token,channel',$t,$attentionResidual) }
         $attention = $upstreamMath::LayerNorm($attentionResidual, $t, 768,
             (Read-OfflineWeight ($layer + 'attention.LayerNorm.weight')), (Read-OfflineWeight ($layer + 'attention.LayerNorm.bias')), [double]1e-12)
         if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.attention.post_norm",'token,channel',$t,$attention) }
-        $feedForward = $upstreamMath::GeluNew((Invoke-OfflineLinear $attention $t ($layer + 'ffn')))
+        }
+        if($useFusedFfn){
+            $ffnWatch=[Diagnostics.Stopwatch]::StartNew();$feedForward=Invoke-OfflineAlbertFusedFfn $attention $t $layer $ffnWorkspace
+            $profile.Add([pscustomobject]@{ Stage="albert.$repeat.ffn_fused"; Kind='FusedFfn'; Milliseconds=$ffnWatch.Elapsed.TotalMilliseconds; Frames=$t })
+        }else{
+        $ffnInput=Invoke-OfflineLinear $attention $t ($layer + 'ffn')
+        $geluWatch=[Diagnostics.Stopwatch]::StartNew()
+        if($AlbertParallelGelu){$feedForward=Invoke-OfflineAlbertGelu $ffnInput}else{$feedForward=$upstreamMath::GeluNew($ffnInput)}
+        $profile.Add([pscustomobject]@{ Stage="albert.$repeat.gelu"; Kind='Gelu'; Milliseconds=$geluWatch.Elapsed.TotalMilliseconds; Frames=$t })
         if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.gelu", 'token,channel', $t, $feedForward) }
         $feedForward = Invoke-OfflineLinear $feedForward $t ($layer + 'ffn_output')
+        }
+        if($useFusedFfn){
+            Invoke-OfflineAlbertResidualNorm $feedForward $attention $t ($layer+'full_layer_layer_norm');$h=$feedForward
+        }else{
         $outputResidual = $upstreamMath::Add($feedForward, $attention)
         if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.output.pre_norm",'token,channel',$t,$outputResidual) }
         $h = $upstreamMath::LayerNorm($outputResidual, $t, 768,
             (Read-OfflineWeight ($layer + 'full_layer_layer_norm.weight')), (Read-OfflineWeight ($layer + 'full_layer_layer_norm.bias')), [double]1e-12)
+        }
         if ($null -ne $script:OfflineAlbertTrace) { $script:OfflineAlbertTrace.Add($h) }
     if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke("albert.$repeat.hidden", 'token,channel', $t, $h) }
     }
@@ -2444,9 +3181,13 @@ function Invoke-OfflineSpeech {
         $durations = [int[]]$SuppliedDurations
     }
     $frames = 0; foreach ($duration in $durations) { $frames += $duration }
-    $aligned = $upstreamMath::ExpandChannels($durationFeatures, $t, 640, $durations)
-    if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke('predictor.aligned', 'channel,frame', $frames, $aligned) }
-    $shared = Invoke-OfflineLstm ($upstreamMath::ChannelsToRows($aligned, 640, $frames)) $frames 'predictor.module.shared'
+    if ($Dense -eq 'Scalar' -or $null -ne $script:OfflineTensorSink) {
+        $aligned = $upstreamMath::ExpandChannels($durationFeatures, $t, 640, $durations)
+        if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke('predictor.aligned', 'channel,frame', $frames, $aligned) }
+        $shared = Invoke-OfflineLstm ($upstreamMath::ChannelsToRows($aligned, 640, $frames)) $frames 'predictor.module.shared'
+    } else {
+        $shared = Invoke-OfflineLstm $durationFeatures $t 'predictor.module.shared' -RepeatDurations $durations
+    }
     $shared = $upstreamMath::RowsToChannels($shared, $frames, 512)
     if ($null -ne $script:OfflineTensorSink) { $script:OfflineTensorSink.Invoke('predictor.shared_channels', 'channel,frame', $frames, $shared) }
     & $endStage 'predictor.shared' $frames
